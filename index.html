@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AdaStudio — edytor Ady</title>
+<link rel="stylesheet" href="styles.css?v=4" />
+</head>
+<body>
+<div id="app">
+
+  <div class="topbar">
+    <div class="brand"><span class="logo">Ada</span><span class="name">AdaStudio</span></div>
+
+    <button class="toolbar-btn" id="btnNew">＋ Nowy plik</button>
+    <button class="toolbar-btn" id="btnOpen">📂 Otwórz</button>
+    <input type="file" id="fileInput" accept=".adb,.ads,.ada,.txt" style="display:none" multiple />
+    <button class="toolbar-btn" id="btnSave">💾 Zapisz</button>
+    <button class="toolbar-btn" id="btnDownload">⬇ Pobierz</button>
+
+    <div class="toolbar-sep"></div>
+
+    <button class="toolbar-btn" id="btnFormat">🧹 Formatuj</button>
+    <button class="toolbar-btn" id="btnFind">🔍 Znajdź</button>
+
+    <div class="toolbar-sep"></div>
+
+    <select class="select-mini" id="fontSizeSelect" title="Rozmiar czcionki">
+      <option value="12">12px</option>
+      <option value="13.5" selected>13.5px</option>
+      <option value="15">15px</option>
+      <option value="17">17px</option>
+      <option value="20">20px</option>
+    </select>
+    <select class="select-mini" id="themeSelect" title="Motyw kolorystyczny">
+      <option value="dark">🌙 Ciemny</option>
+      <option value="light">☀️ Jasny</option>
+      <option value="monokai">🍸 Monokai</option>
+      <option value="nord">❄️ Nord</option>
+      <option value="solarized">🌻 Solarized</option>
+      <option value="dracula">🧛 Dracula</option>
+      <option value="onedark">⚛️ One Dark</option>
+      <option value="gruvbox">🍂 Gruvbox</option>
+      <option value="tokyonight">🌆 Tokyo Night</option>
+      <option value="catppuccin">🐱 Catppuccin</option>
+      <option value="githublight">🐙 GitHub Light</option>
+    </select>
+    <button class="toolbar-btn" id="btnPalette" title="Paleta poleceń">⌘ Polecenia (Ctrl+K)</button>
+    <button class="toolbar-btn" id="btnSettings" title="Ustawienia">⚙ Ustawienia</button>
+
+    <div class="spacer"></div>
+
+    <button class="toolbar-btn primary" id="btnRun">▶ Uruchom (Ctrl+Enter)</button>
+  </div>
+
+  <div class="body-row">
+
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <span>Pliki</span>
+        <button id="btnAddFile" title="Nowy plik">＋</button>
+      </div>
+      <div class="file-list" id="fileList"></div>
+
+      <div class="sidebar-section">
+        <h4>Wstaw fragment</h4>
+        <div id="snippetList"></div>
+      </div>
+
+      <div class="sidebar-section" style="max-height:none;">
+        <h4>Skróty klawiszowe</h4>
+        <div>Ctrl+Enter — uruchom</div>
+        <div>Ctrl+S — zapisz</div>
+        <div>Ctrl+F — znajdź</div>
+        <div>Ctrl+/ — komentarz</div>
+        <div>Ctrl+K — paleta poleceń</div>
+        <div>Ctrl+D — duplikuj wiersz</div>
+        <div>Alt+↑ / Alt+↓ — przesuń wiersz</div>
+        <div>Tab / Shift+Tab — wcięcie</div>
+      </div>
+
+      <div class="sidebar-footer" id="projectStats">0 plików · 0 wierszy</div>
+    </div>
+
+    <div class="editor-area">
+      <div class="tabs" id="tabs"></div>
+
+      <div class="editor-scroll" id="editorScroll">
+        <div class="editor-wrap">
+          <div class="gutter" id="gutter">1</div>
+          <div class="code-stack">
+            <div class="current-line-highlight" id="currentLineHighlight" hidden></div>
+            <pre id="highlightLayer"><code></code></pre>
+            <textarea id="codeInput" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"></textarea>
+            <div class="autocomplete" id="autocompletePopup" hidden></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="statusbar">
+        <span id="statusFile">main.adb</span>
+        <span id="statusPos">Wiersz 1, Kol 1</span>
+        <span id="statusChars">0 znaków</span>
+        <span class="right">
+          <span id="statusMsg">Gotowy</span>
+          <span>Ada</span>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <div class="resizer" id="resizer"></div>
+
+  <div class="terminal-panel" id="terminalPanel">
+    <div class="terminal-header">
+      <div class="traffic"><span class="r"></span><span class="y"></span><span class="g"></span></div>
+      <div class="term-tabs">
+        <button class="term-tab active" id="tabTerminal" data-tab="terminal">Terminal</button>
+        <button class="term-tab" id="tabProblems" data-tab="problems">Problemy <span id="problemsCount" class="badge" hidden>0</span></button>
+      </div>
+      <span class="spacer" style="flex:1"></span>
+      <button class="toolbar-btn" id="btnTermClear" style="padding:3px 8px;">Wyczyść</button>
+      <button class="toolbar-btn" id="btnTermHelp" style="padding:3px 8px;">help</button>
+    </div>
+    <div class="terminal-body" id="terminalBody"></div>
+    <div class="problems-body" id="problemsBody" hidden>
+      <div class="problems-empty" id="problemsEmpty">Brak błędów kompilacji — uruchom program (▶), aby sprawdzić.</div>
+    </div>
+    <div class="terminal-inputrow" id="terminalInputRow">
+      <span class="prompt">user@adastudio adastudio %</span>
+      <input id="terminalInput" placeholder="gnatmake main.adb && ./main   (albo 'help')" />
+    </div>
+  </div>
+
+</div>
+
+<!-- Command palette -->
+<div class="overlay" id="paletteOverlay" hidden>
+  <div class="palette">
+    <input id="paletteInput" placeholder="Wpisz polecenie... (np. Nowy plik, Uruchom, Motyw)" autocomplete="off" />
+    <div class="palette-list" id="paletteList"></div>
+  </div>
+</div>
+
+<!-- Generic modal dialog (replaces window.prompt/confirm) -->
+<div class="overlay" id="modalOverlay" hidden>
+  <div class="modal">
+    <div class="modal-title" id="modalTitle">Tytuł</div>
+    <input class="modal-input" id="modalInput" />
+    <div class="modal-buttons">
+      <button class="toolbar-btn" id="modalCancel">Anuluj</button>
+      <button class="toolbar-btn primary" id="modalOk">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings -->
+<div class="overlay" id="settingsOverlay" hidden>
+  <div class="modal settings-modal">
+    <div class="modal-title">Ustawienia</div>
+    <label class="settings-row">
+      <div class="settings-row-text">
+        <span>Podpowiedzi podczas pisania</span>
+        <small>Sugeruje pakiety (np. po "with Ada."), słowa kluczowe i atrybuty (np. Integer'Image) w trakcie pisania kodu.</small>
+      </div>
+      <span class="toggle-switch">
+        <input type="checkbox" id="toggleAutocomplete" checked />
+        <span class="toggle-slider"></span>
+      </span>
+    </label>
+    <label class="settings-row">
+      <div class="settings-row-text">
+        <span>Tryb hardcore</span>
+        <small>Wyłącza podpowiedzi i wszelkie asysty pisania — dla osób, które wolą pisać kod bez przerywania.</small>
+      </div>
+      <span class="toggle-switch">
+        <input type="checkbox" id="toggleHardcore" />
+        <span class="toggle-slider"></span>
+      </span>
+    </label>
+    <div class="modal-buttons">
+      <button class="toolbar-btn primary" id="settingsClose">Zamknij</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast notifications -->
+<div class="toast-stack" id="toastStack"></div>
+
+<script src="highlight.js?v=4"></script>
+<script src="interpreter.js?v=4"></script>
+<script src="app.js?v=4"></script>
+</body>
+</html>
