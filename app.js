@@ -904,15 +904,17 @@ class Interpreter {
     this.stepCount = 0;
   }
 
-  run(source) {
+  // `onNeedInput` is called (and awaited) whenever the program executes Get/Get_Line;
+  // it must resolve with the raw line of text the "user" typed at the terminal.
+  async run(source, onNeedInput) {
     const tokens = new Lexer(source).tokens;
     const program = new Parser(tokens).parseProgram();
     const rootEnv = new Env(null);
     this.declareBlock(program.decls, rootEnv);
     try {
-      this.execStatements(program.body, rootEnv);
+      await driveGenerator(this.execStatements(program.body, rootEnv), onNeedInput);
     } catch (err) {
-      if (err instanceof AdaError && program.handlers && this.tryHandle(err, program.handlers, rootEnv)) {
+      if (err instanceof AdaError && program.handlers && await driveGenerator(this.tryHandle(err, program.handlers, rootEnv), onNeedInput)) {
         // handled
       } else {
         this.flushLine();
@@ -1046,15 +1048,15 @@ class Interpreter {
     }
   }
 
-  execStatements(stmts, env) {
-    for (const s of stmts) this.execStatement(s, env);
+  *execStatements(stmts, env) {
+    for (const s of stmts) yield* this.execStatement(s, env);
   }
 
-  tryHandle(err, handlers, env) {
+  *tryHandle(err, handlers, env) {
     const excName = (err.message.match(/raised\s+(\S+)/i)?.[1] || "").replace(/[:.]$/, "").toUpperCase();
     for (const h of handlers) {
       if (h.names.includes("others") || h.names.some(n => n.toUpperCase() === excName)) {
-        this.execStatements(h.body, env);
+        yield* this.execStatements(h.body, env);
         return true;
       }
     }
@@ -1102,7 +1104,7 @@ class Interpreter {
     throw new AdaError(`cannot use an aggregate here`);
   }
 
-  execStatement(s, env) {
+  *execStatement(s, env) {
     this.bump();
     switch (s.kind) {
       case "null": return;
@@ -1140,13 +1142,13 @@ class Interpreter {
         return;
       }
       case "call":
-        this.execCall(s.name, s.args, env, s.line, s.col);
+        yield* this.execCall(s.name, s.args, env, s.line, s.col);
         return;
       case "if": {
         for (const b of s.branches) {
-          if (this.evalExpr(b.cond, env) === true) { this.execStatements(b.body, env); return; }
+          if (this.evalExpr(b.cond, env) === true) { yield* this.execStatements(b.body, env); return; }
         }
-        if (s.elseStmts) this.execStatements(s.elseStmts, env);
+        if (s.elseStmts) yield* this.execStatements(s.elseStmts, env);
         return;
       }
       case "case": {
@@ -1159,18 +1161,18 @@ class Interpreter {
               ? valuesEqual(this.evalExpr(c.value, env), val)
               : ordinalOf(val) >= ordinalOf(this.evalExpr(c.from, env)) && ordinalOf(val) <= ordinalOf(this.evalExpr(c.to, env))
           );
-          if (hit) { this.execStatements(w.body, env); return; }
+          if (hit) { yield* this.execStatements(w.body, env); return; }
         }
-        if (othersBranch) { this.execStatements(othersBranch.body, env); return; }
+        if (othersBranch) { yield* this.execStatements(othersBranch.body, env); return; }
         throw new AdaError(`raised CONSTRAINT_ERROR : case selector out of range`, s.line, s.col);
       }
       case "declare": {
         const childEnv = new Env(env);
         this.declareBlock(s.decls, childEnv);
         try {
-          this.execStatements(s.body, childEnv);
+          yield* this.execStatements(s.body, childEnv);
         } catch (err) {
-          if (err instanceof AdaError && s.handlers && this.tryHandle(err, s.handlers, childEnv)) return;
+          if (err instanceof AdaError && s.handlers && (yield* this.tryHandle(err, s.handlers, childEnv))) return;
           throw err;
         }
         return;
@@ -1182,16 +1184,16 @@ class Interpreter {
         env.setVarEntry(s.varName, { type: "Integer", value: from, constant: false });
         const entry = env.vars.get(s.varName.toLowerCase());
         if (s.reverse) {
-          for (let i = to; i >= from; i--) { entry.value = i; this.execStatements(s.body, env); }
+          for (let i = to; i >= from; i--) { entry.value = i; yield* this.execStatements(s.body, env); }
         } else {
-          for (let i = from; i <= to; i++) { entry.value = i; this.execStatements(s.body, env); }
+          for (let i = from; i <= to; i++) { entry.value = i; yield* this.execStatements(s.body, env); }
         }
         if (prevEntry) env.vars.set(s.varName.toLowerCase(), prevEntry); else env.vars.delete(s.varName.toLowerCase());
         return;
       }
       case "while": {
         while (this.evalExpr(s.cond, env) === true) {
-          this.execStatements(s.body, env);
+          yield* this.execStatements(s.body, env);
           this.bump();
         }
         return;
@@ -1209,7 +1211,7 @@ class Interpreter {
     }
   }
 
-  execCall(name, args, env, line, col) {
+  *execCall(name, args, env, line, col) {
     const lname = name.toLowerCase();
     if (lname === "put_line") {
       this.flushLine();
@@ -1225,12 +1227,34 @@ class Interpreter {
       this.onOutput("");
       return;
     }
+    if (lname === "get" || lname === "get_line") {
+      if (!args.length || args[0].kind !== "var") {
+        throw new AdaError(`Get/Get_Line here only supports a plain variable argument`, line, col);
+      }
+      const entry = env.getVarEntry(args[0].name);
+      if (!entry) throw new AdaError(`"${args[0].name}" is undefined`, line, col);
+      if (entry.constant) throw new AdaError(`left hand side of assignment must not be constant`, line, col);
+      this.flushLine(); // show any prompt text already Put() on this line before waiting on stdin
+      const raw = (yield { __inputRequest: true }).trim();
+      if (lname === "get_line") {
+        entry.value = raw;
+      } else if (typeof entry.value === "boolean") {
+        entry.value = /^true$/i.test(raw);
+      } else if (typeof entry.value === "number") {
+        const n = Number(raw);
+        if (raw === "" || Number.isNaN(n)) throw new AdaError(`raised DATA_ERROR`, line, col);
+        entry.value = n;
+      } else {
+        entry.value = raw;
+      }
+      return;
+    }
     const sub = env.getSub(name);
-    if (sub) { this.callSub(sub, args, env); return; }
+    if (sub) { yield* this.callSub(sub, args, env); return; }
     throw new AdaError(`"${name}" is undefined`, line, col);
   }
 
-  callSub(sub, argExprs, callerEnv) {
+  *callSub(sub, argExprs, callerEnv) {
     if (argExprs.length !== sub.params.length) {
       throw new AdaError(`wrong number of arguments to "${sub.name}"`);
     }
@@ -1243,13 +1267,13 @@ class Interpreter {
 
     let result, returned = false;
     try {
-      this.execStatements(sub.body, newEnv);
+      yield* this.execStatements(sub.body, newEnv);
     } catch (err) {
       if (err instanceof ReturnSignal) {
         result = err.value; returned = true;
       } else if (err instanceof AdaError && sub.handlers) {
         try {
-          if (!this.tryHandle(err, sub.handlers, newEnv)) throw err;
+          if (!(yield* this.tryHandle(err, sub.handlers, newEnv))) throw err;
         } catch (err2) {
           if (err2 instanceof ReturnSignal) { result = err2.value; returned = true; }
           else throw err2;
@@ -1373,7 +1397,8 @@ class Interpreter {
         const sub = env.getSub(e.name);
         if (sub) {
           if (sub.kind !== "function") throw new AdaError(`"${e.name}" is not a function`, e.line, e.col);
-          return this.callSub(sub, e.args, env);
+          // evalExpr is synchronous, so a function used inside an expression can't pause for Get/Get_Line
+          return runGenSync(this.callSub(sub, e.args, env), e.line, e.col);
         }
         if (["integer", "float", "natural", "positive"].includes(lname)) {
           return e.args.length ? this.evalExpr(e.args[0], env) : 0;
@@ -1415,9 +1440,33 @@ class Interpreter {
   }
 }
 
-function runAdaProgram(source, onOutput) {
+// Drives a statement/call generator to completion, forwarding each Get/Get_Line
+// pause to `onNeedInput` and feeding its (awaited) answer back in.
+async function driveGenerator(gen, onNeedInput) {
+  let sent;
+  for (;;) {
+    const { value, done } = gen.next(sent);
+    if (done) return value;
+    sent = await onNeedInput();
+  }
+}
+
+// Drains a statement/call generator synchronously — used where Get/Get_Line can't
+// pause (e.g. a function called from inside an expression).
+function runGenSync(gen, line, col) {
+  let res = gen.next();
+  while (!res.done) {
+    if (res.value && res.value.__inputRequest) {
+      throw new AdaError(`Get/Get_Line can only be used as a standalone statement here`, line, col);
+    }
+    res = gen.next();
+  }
+  return res.value;
+}
+
+async function runAdaProgram(source, onOutput, onNeedInput) {
   const interp = new Interpreter(onOutput);
-  return interp.run(source);
+  return interp.run(source, onNeedInput);
 }
 
 // AdaStudio — main application logic: file/tab management, editor sync,
@@ -1461,6 +1510,8 @@ const ADA_HELP = {
   put_line: "Put_Line(S : String) — wypisuje tekst i przechodzi do nowej linii. Pakiet: Ada.Text_IO.",
   put: "Put(S : String) — wypisuje tekst bez przejścia do nowej linii.",
   new_line: "New_Line — wypisuje pusty wiersz.",
+  get: "Get(Zmienna) — czyta wartość ze standardowego wejścia (terminal) i przypisuje ją do zmiennej.",
+  get_line: "Get_Line(Zmienna : String) — czyta cały wiersz tekstu ze standardowego wejścia.",
   "integer'image": "Integer'Image(X) — zamienia liczbę całkowitą na String (ze spacją wiodącą dla liczb dodatnich).",
   for: "for I in A .. B loop ... end loop; — pętla z licznikiem od A do B (użyj 'reverse' dla malejącej).",
   while: "while WARUNEK loop ... end loop; — pętla warunkowa.",
@@ -1499,11 +1550,13 @@ const ADA_PACKAGES = [
 // Only attributes the mini-interpreter actually evaluates (see interpreter.js evalExpr "attr"/"attrcall").
 const ADA_ATTRIBUTES = ["Image", "Value", "First", "Last", "Length", "Val", "Pos"];
 
-// Only the subprograms execCall() in interpreter.js actually knows how to run.
+// Only the subprograms execCall() actually knows how to run.
 const ADA_BUILTINS = [
   { name: "Put_Line", insertText: 'Put_Line("");', cursorOffset: 'Put_Line("'.length },
   { name: "Put", insertText: 'Put("");', cursorOffset: 'Put("'.length },
   { name: "New_Line", insertText: "New_Line;" },
+  { name: "Get", insertText: "Get();", cursorOffset: "Get(".length },
+  { name: "Get_Line", insertText: "Get_Line();", cursorOffset: "Get_Line(".length },
 ];
 
 const ADA_TYPE_LIST = [...ADA_TYPES];
@@ -2379,14 +2432,37 @@ function compilerErrorLine(fileName, err) {
   return `${fileName}: error: ${err.message}`;
 }
 
-function runCurrentFile() {
+// A program that reads input can't be safely auto-run with a canned dummy answer to
+// "check for errors" — its own loop condition may depend on what's typed (e.g.
+// `while opcja /= 3 loop ... Get(opcja);`), so a constant dummy reply can loop forever.
+// For such programs the pre-run check only lexes/parses (catches syntax errors);
+// runtime errors surface the first time the program is actually, interactively run.
+function readsInput(source) { return /\b(get|get_line)\s*\(/i.test(source); }
+function parseCheck(source) { new Parser(new Lexer(source).tokens).parseProgram(); }
+
+// Stdin for a program that isn't actually being watched (a plain compile-check,
+// or `gprbuild`ing every file) — Get/Get_Line get an instant dummy answer instead
+// of blocking, so background checks never hang waiting for a terminal that isn't shown.
+function dummyStdin() { return Promise.resolve("0"); }
+
+// Stdin for a program the user is actually running: pause on the terminal's own
+// input row (its Enter handler resolves `pendingInputResolve`) exactly like a real
+// terminal would block a program's stdin read.
+let pendingInputResolve = null;
+function interactiveStdin() {
+  setTerminalTab("terminal");
+  termInput.focus();
+  return new Promise((resolve) => { pendingInputResolve = resolve; });
+}
+
+async function runCurrentFile() {
   const f = getActive();
   if (!f) return;
-  try { gnatmake(f.name, true); } catch { /* error already logged to terminal + problems panel */ }
+  try { await gnatmake(f.name, true); } catch { /* error already logged to terminal + problems panel */ }
 }
 el("btnRun").addEventListener("click", runCurrentFile);
 
-function gnatmake(target, autoRun) {
+async function gnatmake(target, autoRun) {
   const f = files.find(x => x.name === target);
   if (!f) {
     logTerm(`gnatmake: "${target}" not found, use -P<project> if this is a multi-unit project`, "err");
@@ -2396,8 +2472,10 @@ function gnatmake(target, autoRun) {
   logTerm(`gcc -c -gnatQ ${f.name}`, "info");
   clearProblemsFor(f.name);
   try {
-    const output = [];
-    runAdaProgram(f.content, (line) => output.push(line));
+    // silent check pass first — full run (Get/Get_Line answered instantly) for ordinary
+    // programs, parse-only for ones that read input (see readsInput() above)
+    if (readsInput(f.content)) parseCheck(f.content);
+    else await runAdaProgram(f.content, () => {}, dummyStdin);
     logTerm(`gnatbind -x ${exe}.ali`, "info");
     logTerm(`gnatlink ${exe}.ali`, "info");
     compiledBinaries.add(exe);
@@ -2405,7 +2483,7 @@ function gnatmake(target, autoRun) {
     toast(`${f.name}: kompilacja OK`, "ok");
     if (autoRun) {
       logTerm(`./${exe}`, "cmd");
-      output.forEach(line => logTerm(line, "out"));
+      await runAdaProgram(f.content, (line) => logTerm(line, "out"), interactiveStdin);
       logTerm(`+ exited with code 0`, "info");
     }
   } catch (err) {
@@ -2418,7 +2496,7 @@ function gnatmake(target, autoRun) {
   }
 }
 
-function runBinary(exe) {
+async function runBinary(exe) {
   if (!compiledBinaries.has(exe)) {
     logTerm(`zsh: no such file or directory: ./${exe}`, "err");
     return;
@@ -2426,9 +2504,7 @@ function runBinary(exe) {
   const f = files.find(x => baseName(x.name) === exe);
   if (!f) { logTerm(`zsh: no such file or directory: ./${exe}`, "err"); return; }
   try {
-    const output = [];
-    runAdaProgram(f.content, (line) => output.push(line));
-    output.forEach(line => logTerm(line, "out"));
+    await runAdaProgram(f.content, (line) => logTerm(line, "out"), interactiveStdin);
     logTerm(`+ exited with code 0`, "info");
   } catch (err) {
     logTerm(`raised ${err.message.startsWith("raised") ? err.message.slice(7) : err.message}`, "err");
@@ -2548,7 +2624,7 @@ const MAN_PAGES = {
   cat: "CAT(1)\n\n    cat [-n] plik...\n\n    Wypisuje zawartość plików. -n numeruje wiersze.",
 };
 
-function handleCommand(raw) {
+async function handleCommand(raw) {
   const cmd = raw.trim();
   if (!cmd) return;
   logTerm(cmd, "cmd");
@@ -2687,7 +2763,7 @@ function handleCommand(raw) {
 
       case "run":
       case "rebuild":
-        try { runCurrentFile(); } catch { /* error already logged */ }
+        try { await runCurrentFile(); } catch { /* error already logged */ }
         break;
 
       case "gnatmake":
@@ -2704,15 +2780,15 @@ function handleCommand(raw) {
         const args = lhead === "gnat" ? rest.slice(1) : rest;
         const target = args.find(a => !a.startsWith("-")) || getActive()?.name;
         if (!target) { logTerm("gnatmake: file name missing", "err"); break; }
-        try { gnatmake(target, false); } catch { /* error already logged */ }
+        try { await gnatmake(target, false); } catch { /* error already logged */ }
         break;
       }
 
       case "gprbuild":
         logTerm("gprbuild: building all units in project", "info");
-        files.filter(f => /\.(adb)$/i.test(f.name)).forEach(f => {
-          try { gnatmake(f.name, false); } catch { /* continue */ }
-        });
+        for (const f of files.filter(f => /\.(adb)$/i.test(f.name))) {
+          try { await gnatmake(f.name, false); } catch { /* continue */ }
+        }
         logTerm("Build complete.", "ok");
         break;
 
@@ -2769,7 +2845,7 @@ function handleCommand(raw) {
 
       default:
         if (lhead.startsWith("./")) {
-          runBinary(lhead.slice(2));
+          await runBinary(lhead.slice(2));
         } else if (lhead === "new") {
           if (!arg) { logTerm("użycie: new <nazwa_pliku>", "err"); break; }
           createFile(arg, "");
@@ -2797,7 +2873,17 @@ termInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
     const val = termInput.value;
     termInput.value = "";
+    if (pendingInputResolve) {
+      logTerm(val, "out"); // echo what the running program just read as stdin
+      const resolve = pendingInputResolve;
+      pendingInputResolve = null;
+      resolve(val);
+      return;
+    }
     handleCommand(val);
+  } else if (pendingInputResolve) {
+    // while a program is blocked on Get/Get_Line, the input row is its stdin —
+    // shell history/tab-completion don't apply
   } else if (e.key === "ArrowUp") {
     e.preventDefault();
     if (historyIdx > 0) { historyIdx--; termInput.value = history[historyIdx] || ""; }
