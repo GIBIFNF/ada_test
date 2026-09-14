@@ -179,6 +179,9 @@ function valuesEqual(a, b) {
   return a === b;
 }
 function ordinalOf(v) { return v instanceof AdaEnum ? v.ordinal : v; }
+// Ada rounds to the nearest whole number, ties away from zero (RM 4.6) — unlike
+// JS Math.round, which rounds -2.5 to -2 instead of -3.
+function adaRound(x) { return x < 0 ? -Math.round(-x) : Math.round(x); }
 
 class Lexer {
   constructor(src) {
@@ -1419,6 +1422,8 @@ class Interpreter {
         }
         if (typeof v === "string" && e.attr === "Length") return v.length;
         if (e.attr === "Image") return this.imageOf(v);
+        if (e.attr === "Round" && typeof v === "number") return adaRound(v);
+        if (e.attr === "Truncation" && typeof v === "number") return Math.trunc(v);
         return v;
       }
       case "attrcall": {
@@ -1458,8 +1463,13 @@ class Interpreter {
           // evalExpr is synchronous, so a function used inside an expression can't pause for Get/Get_Line
           return runGenSync(this.callSub(sub, e.args, env), e.line, e.col);
         }
-        if (["integer", "float", "natural", "positive"].includes(lname)) {
-          return e.args.length ? this.evalExpr(e.args[0], env) : 0;
+        if (["integer", "natural", "positive", "long_integer", "short_integer"].includes(lname)) {
+          if (!e.args.length) return 0;
+          const v = this.evalExpr(e.args[0], env);
+          return typeof v === "number" ? adaRound(v) : v; // Integer(3.7) rounds to 4, per RM 4.6
+        }
+        if (lname === "float" || lname === "long_float") {
+          return e.args.length ? this.evalExpr(e.args[0], env) : 0.0;
         }
         if (MATH_FUNCTIONS[lname]) {
           const argv = e.args.map(a => this.evalExpr(a, env));
@@ -1575,6 +1585,8 @@ const ADA_HELP = {
   get: "Get(Zmienna) — czyta wartość ze standardowego wejścia (terminal) i przypisuje ją do zmiennej.",
   get_line: "Get_Line(Zmienna : String) — czyta cały wiersz tekstu ze standardowego wejścia.",
   "integer'image": "Integer'Image(X) — zamienia liczbę całkowitą na String (ze spacją wiodącą dla liczb dodatnich).",
+  "'round": "X'Round — zaokrągla Float do najbliższej liczby całkowitej (przy remisie: od zera). Integer(X) robi to samo.",
+  round: "Integer(X) — konwersja Float→Integer zaokrągla do najbliższej wartości (przy remisie: od zera), zgodnie z Adą.",
   for: "for I in A .. B loop ... end loop; — pętla z licznikiem od A do B (użyj 'reverse' dla malejącej).",
   while: "while WARUNEK loop ... end loop; — pętla warunkowa.",
   if: "if WARUNEK then ... elsif ... else ... end if; — instrukcja warunkowa.",
@@ -1610,7 +1622,7 @@ const ADA_PACKAGES = [
 ];
 
 // Only attributes the mini-interpreter actually evaluates (see interpreter.js evalExpr "attr"/"attrcall").
-const ADA_ATTRIBUTES = ["Image", "Value", "First", "Last", "Length", "Val", "Pos"];
+const ADA_ATTRIBUTES = ["Image", "Value", "First", "Last", "Length", "Val", "Pos", "Round", "Truncation"];
 
 // Only the subprograms execCall() actually knows how to run.
 const ADA_BUILTINS = [
