@@ -143,6 +143,8 @@ class ReturnSignal {
   constructor(value) { this.value = value; }
 }
 
+class LoopExitSignal {}
+
 class AdaArray {
   constructor(low, high, items) {
     this.low = low;
@@ -234,6 +236,12 @@ class Lexer {
         const start = i;
         let j = i;
         while (j < n && /[0-9_.]/.test(src[j])) j++;
+        // scientific notation: 6.674E-11, 1E10, 5_972E24, ...
+        if ((src[j] === "e" || src[j] === "E") && /[0-9+-]/.test(src[j + 1] || "")) {
+          j++;
+          if (src[j] === "+" || src[j] === "-") j++;
+          while (j < n && /[0-9_]/.test(src[j])) j++;
+        }
         push("number", src.slice(i, j).replace(/_/g, ""), start);
         i = j;
         continue;
@@ -522,6 +530,7 @@ class Parser {
     if (this.atKeyword("if")) return this.parseIf();
     if (this.atKeyword("for")) return this.parseFor();
     if (this.atKeyword("while")) return this.parseWhile();
+    if (this.atKeyword("loop")) return this.parseBareLoop();
     if (this.atKeyword("case")) return this.parseCase();
     if (this.atKeyword("declare")) return this.parseDeclare();
     if (this.atKeyword("begin")) return this.parseBareBlock();
@@ -712,6 +721,16 @@ class Parser {
     return { kind: "while", cond, body };
   }
 
+  // Bare `loop ... end loop;` — an unconditional loop, terminated only by `exit`/`exit when`.
+  parseBareLoop() {
+    this.next(); // loop
+    const body = this.parseStatements(["end"]);
+    this.expectKeyword("end");
+    this.expectKeyword("loop");
+    this.expectOp(";");
+    return { kind: "loop", body };
+  }
+
   // expression parsing (precedence climbing)
   parseExpr() { return this.parseOr(); }
   parseOr() {
@@ -822,7 +841,7 @@ class Parser {
   }
   parsePrimary() {
     const t = this.peek();
-    if (t.type === "number") { this.next(); return { kind: "lit", value: parseFloat(t.value), isFloat: t.value.includes(".") }; }
+    if (t.type === "number") { this.next(); return { kind: "lit", value: parseFloat(t.value), isFloat: /[.eE]/.test(t.value) }; }
     if (t.type === "string") { this.next(); return { kind: "lit", value: t.value, isString: true }; }
     if (t.type === "char") { this.next(); return { kind: "lit", value: t.value, isChar: true }; }
     if (this.atKeyword("true")) { this.next(); return { kind: "lit", value: true }; }
@@ -895,6 +914,17 @@ const SCALAR_BOUNDS = {
   short_integer: [-32768, 32767],
   float: [-1e300, 1e300],
   boolean: [false, true],
+};
+
+// Ada.Numerics.Elementary_Functions, the handful that come up in student programs.
+const MATH_FUNCTIONS = {
+  sqrt: Math.sqrt,
+  sin: Math.sin,
+  cos: Math.cos,
+  tan: Math.tan,
+  arctan: Math.atan,
+  log: (x, base) => (base == null ? Math.log(x) : Math.log(x) / Math.log(base)),
+  exp: Math.exp,
 };
 
 class Interpreter {
@@ -1183,18 +1213,37 @@ class Interpreter {
         const prevEntry = env.vars.get(s.varName.toLowerCase());
         env.setVarEntry(s.varName, { type: "Integer", value: from, constant: false });
         const entry = env.vars.get(s.varName.toLowerCase());
-        if (s.reverse) {
-          for (let i = to; i >= from; i--) { entry.value = i; yield* this.execStatements(s.body, env); }
-        } else {
-          for (let i = from; i <= to; i++) { entry.value = i; yield* this.execStatements(s.body, env); }
+        try {
+          if (s.reverse) {
+            for (let i = to; i >= from; i--) { entry.value = i; yield* this.execStatements(s.body, env); }
+          } else {
+            for (let i = from; i <= to; i++) { entry.value = i; yield* this.execStatements(s.body, env); }
+          }
+        } catch (err) {
+          if (!(err instanceof LoopExitSignal)) throw err;
         }
         if (prevEntry) env.vars.set(s.varName.toLowerCase(), prevEntry); else env.vars.delete(s.varName.toLowerCase());
         return;
       }
       case "while": {
-        while (this.evalExpr(s.cond, env) === true) {
-          yield* this.execStatements(s.body, env);
-          this.bump();
+        try {
+          while (this.evalExpr(s.cond, env) === true) {
+            yield* this.execStatements(s.body, env);
+            this.bump();
+          }
+        } catch (err) {
+          if (!(err instanceof LoopExitSignal)) throw err;
+        }
+        return;
+      }
+      case "loop": {
+        try {
+          for (;;) {
+            yield* this.execStatements(s.body, env);
+            this.bump();
+          }
+        } catch (err) {
+          if (!(err instanceof LoopExitSignal)) throw err;
         }
         return;
       }
@@ -1204,8 +1253,10 @@ class Interpreter {
         const detail = s.msg ? ` : ${s.msg}` : "";
         throw new AdaError(`raised ${s.excName.toUpperCase()}${detail}`, s.line, s.col);
       }
-      case "exit":
-        return; // best-effort: real Ada `exit` breaks the innermost loop; not needed for straight-line student programs
+      case "exit": {
+        if (s.cond == null || this.evalExpr(s.cond, env) === true) throw new LoopExitSignal();
+        return;
+      }
       default:
         throw new AdaError(`unsupported statement: ${s.kind}`);
     }
@@ -1226,6 +1277,13 @@ class Interpreter {
       this.flushLine();
       this.onOutput("");
       return;
+    }
+    if (lname === "flush") {
+      this.flushLine(); // our terminal streams output live, so there's nothing else to flush
+      return;
+    }
+    if (lname === "skip_line") {
+      return; // no-op: Get() here always consumes one full line already
     }
     if (lname === "get" || lname === "get_line") {
       if (!args.length || args[0].kind !== "var") {
@@ -1402,6 +1460,10 @@ class Interpreter {
         }
         if (["integer", "float", "natural", "positive"].includes(lname)) {
           return e.args.length ? this.evalExpr(e.args[0], env) : 0;
+        }
+        if (MATH_FUNCTIONS[lname]) {
+          const argv = e.args.map(a => this.evalExpr(a, env));
+          return MATH_FUNCTIONS[lname](...argv);
         }
         throw new AdaError(`"${e.name}" is undefined`, e.line, e.col);
       }
