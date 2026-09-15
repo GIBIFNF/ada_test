@@ -189,7 +189,48 @@ html, body {
   flex-direction: column;
   min-width: 0;
   background: var(--bg);
+  position: relative;
 }
+
+.find-bar {
+  position: absolute;
+  top: 44px; right: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.35);
+  padding: 8px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.find-bar[hidden] { display: none; }
+.find-row { display: flex; align-items: center; gap: 6px; }
+.find-row input {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12.5px;
+  padding: 5px 8px;
+  width: 160px;
+  outline: none;
+}
+.find-row input:focus { border-color: var(--accent); }
+.find-count { font-size: 11px; color: var(--text-dim); min-width: 40px; text-align: center; flex-shrink: 0; }
+.find-row button {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 8px;
+  flex-shrink: 0;
+}
+.find-row button:hover { border-color: var(--accent); }
+.find-row button:disabled { opacity: .4; cursor: default; }
 
 .tabs {
   display: flex;
@@ -463,6 +504,50 @@ body.githublight .terminal-panel { background: #f6f8fa; }
 body.githublight .terminal-header { background: #eaeef2; }
 body.githublight #codeInput { caret-color: #000; }
 
+body.rosepine {
+  --bg: #191724; --bg-alt: #1f1d2e; --panel: #26233a; --border: #403d52;
+  --text: #e0def4; --text-dim: #908caa; --accent: #c4a7e7; --accent-2: #9ccfd8;
+  --danger: #eb6f92; --warn: #f6c177; --gutter: #6e6a86;
+  --tok-keyword: #ebbcba; --tok-type: #f6c177; --tok-string: #9ccfd8;
+  --tok-comment: #6e6a86; --tok-number: #c4a7e7; --tok-attr: #9ccfd8; --tok-call: #9ccfd8;
+}
+
+body.ayu {
+  --bg: #0b0e14; --bg-alt: #0d1017; --panel: #131721; --border: #232834;
+  --text: #bfbdb6; --text-dim: #565b66; --accent: #ffb454; --accent-2: #aad94c;
+  --danger: #f07178; --warn: #e6b673; --gutter: #4d5566;
+  --tok-keyword: #ff8f40; --tok-type: #59c2ff; --tok-string: #aad94c;
+  --tok-comment: #565b66; --tok-number: #d2a6ff; --tok-attr: #ffb454; --tok-call: #ffb454;
+}
+
+body.everforest {
+  --bg: #2b3339; --bg-alt: #232a2e; --panel: #333c43; --border: #4a555b;
+  --text: #d3c6aa; --text-dim: #859289; --accent: #a7c080; --accent-2: #83c092;
+  --danger: #e67e80; --warn: #dbbc7f; --gutter: #7a8478;
+  --tok-keyword: #e67e80; --tok-type: #dbbc7f; --tok-string: #a7c080;
+  --tok-comment: #859289; --tok-number: #d699b6; --tok-attr: #83c092; --tok-call: #7fbbb3;
+}
+
+body.synthwave {
+  --bg: #262335; --bg-alt: #1f1c2c; --panel: #2a2139; --border: #4b3f6b;
+  --text: #f4eee4; --text-dim: #a58fc9; --accent: #f97e72; --accent-2: #36f9f6;
+  --danger: #fe4450; --warn: #f6d32b; --gutter: #7a6ba3;
+  --tok-keyword: #fe4450; --tok-type: #36f9f6; --tok-string: #f6d32b;
+  --tok-comment: #7a6ba3; --tok-number: #f97e72; --tok-attr: #ff7edb; --tok-call: #ff7edb;
+}
+
+body.nordlight {
+  --bg: #eceff4; --bg-alt: #e5e9f0; --panel: #d8dee9; --border: #c6cddb;
+  --text: #2e3440; --text-dim: #4c566a; --accent: #5e81ac; --accent-2: #4d8560;
+  --danger: #bf616a; --warn: #a5750a; --gutter: #6b7484;
+  --tok-keyword: #5e81ac; --tok-type: #6e7fa0; --tok-string: #4d8560;
+  --tok-comment: #7b8394; --tok-number: #a75da0; --tok-attr: #986801; --tok-call: #5e81ac;
+  color-scheme: light;
+}
+body.nordlight .terminal-panel { background: #e5e9f0; }
+body.nordlight .terminal-header { background: #d8dee9; }
+body.nordlight #codeInput { caret-color: #000; }
+
 /* ---------- sidebar footer ---------- */
 .sidebar-footer {
   padding: 8px 12px;
@@ -614,6 +699,19 @@ body.githublight #codeInput { caret-color: #000; }
   background: color-mix(in srgb, var(--text) 6%, transparent);
   pointer-events: none;
   z-index: 0;
+}
+
+.error-line-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+.error-line-highlight {
+  position: absolute;
+  left: 0; right: 0;
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  border-left: 3px solid var(--danger);
 }
 
 .autocomplete {

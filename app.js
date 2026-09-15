@@ -2202,6 +2202,8 @@ function renderAll() {
   renderFileList();
   updateStatus();
   acHide();
+  renderErrorHighlights();
+  if (el("findBar") && !el("findBar").hidden) closeFindBar();
 }
 
 function insertAtCursor(text) {
@@ -2548,19 +2550,126 @@ function toggleComment() {
   onCodeChanged();
 }
 
-async function findInEditor() {
-  const term = await showModal("Znajdź w bieżącym pliku:");
-  if (!term) return;
-  const idx = codeInput.value.indexOf(term);
-  if (idx === -1) {
-    toast(`Nie znaleziono: "${term}"`, "err");
-    return;
+// ---------- find & replace ----------
+let findMatches = [];
+let findActiveIndex = -1;
+
+function findAllMatches(term) {
+  if (!term) return [];
+  const hay = codeInput.value.toLowerCase();
+  const needle = term.toLowerCase();
+  const matches = [];
+  let from = 0;
+  while (true) {
+    const idx = hay.indexOf(needle, from);
+    if (idx === -1) break;
+    matches.push(idx);
+    from = idx + needle.length;
   }
+  return matches;
+}
+
+function updateFindMatches({ keepIndex } = {}) {
+  const term = el("findInput").value;
+  const prevStart = keepIndex && findActiveIndex >= 0 ? findMatches[findActiveIndex] : null;
+  findMatches = findAllMatches(term);
+  if (prevStart != null) {
+    findActiveIndex = findMatches.indexOf(prevStart);
+    if (findActiveIndex === -1) findActiveIndex = findMatches.length ? 0 : -1;
+  } else {
+    findActiveIndex = findMatches.length ? 0 : -1;
+  }
+  el("findCount").textContent = findMatches.length ? `${findActiveIndex + 1}/${findMatches.length}` : "0/0";
+  const hasMatches = findMatches.length > 0;
+  el("findPrevBtn").disabled = !hasMatches;
+  el("findNextBtn").disabled = !hasMatches;
+  el("replaceOneBtn").disabled = !hasMatches;
+  el("replaceAllBtn").disabled = !hasMatches;
+  selectActiveMatch();
+}
+
+function selectActiveMatch() {
+  if (findActiveIndex < 0 || !findMatches.length) return;
+  const term = el("findInput").value;
+  const start = findMatches[findActiveIndex];
   codeInput.focus();
-  codeInput.selectionStart = idx;
-  codeInput.selectionEnd = idx + term.length;
+  codeInput.selectionStart = start;
+  codeInput.selectionEnd = start + term.length;
   updateStatus();
 }
+
+function findStep(dir) {
+  if (!findMatches.length) return;
+  findActiveIndex = (findActiveIndex + dir + findMatches.length) % findMatches.length;
+  el("findCount").textContent = `${findActiveIndex + 1}/${findMatches.length}`;
+  selectActiveMatch();
+}
+
+function replaceActiveMatch() {
+  if (findActiveIndex < 0 || !findMatches.length) return;
+  const term = el("findInput").value;
+  const replacement = el("replaceInput").value;
+  const start = findMatches[findActiveIndex];
+  const val = codeInput.value;
+  codeInput.value = val.slice(0, start) + replacement + val.slice(start + term.length);
+  codeInput.selectionStart = codeInput.selectionEnd = start + replacement.length;
+  onCodeChanged();
+  updateFindMatches();
+}
+
+function replaceAllMatches() {
+  const term = el("findInput").value;
+  if (!term) return;
+  const replacement = el("replaceInput").value;
+  const count = findMatches.length;
+  if (!count) return;
+  // Replace back-to-front so earlier offsets stay valid as we go.
+  let val = codeInput.value;
+  for (let i = findMatches.length - 1; i >= 0; i--) {
+    val = val.slice(0, findMatches[i]) + replacement + val.slice(findMatches[i] + term.length);
+  }
+  codeInput.value = val;
+  onCodeChanged();
+  updateFindMatches();
+  toast(`Zamieniono ${count} ${count === 1 ? "wystąpienie" : "wystąpień"}`, "ok");
+}
+
+function openFindBar() {
+  const bar = el("findBar");
+  bar.hidden = false;
+  const selected = codeInput.value.slice(codeInput.selectionStart, codeInput.selectionEnd);
+  if (selected && !selected.includes("\n")) el("findInput").value = selected;
+  el("findInput").focus();
+  el("findInput").select();
+  updateFindMatches();
+}
+function closeFindBar() {
+  el("findBar").hidden = true;
+  findMatches = [];
+  findActiveIndex = -1;
+  codeInput.focus();
+}
+
+el("findInput").addEventListener("input", () => updateFindMatches());
+el("findInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); findStep(e.shiftKey ? -1 : 1); }
+});
+el("replaceInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); replaceActiveMatch(); }
+});
+// Global, not scoped to the bar's own focus: after a click (e.g. "Zamień wszystko"
+// leaving zero matches) focus can end up outside the bar's subtree entirely, where a
+// listener on the bar itself would never see the keydown bubble through it.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !el("findBar").hidden) { e.preventDefault(); closeFindBar(); }
+});
+el("findPrevBtn").addEventListener("click", () => findStep(-1));
+el("findNextBtn").addEventListener("click", () => findStep(1));
+el("findCloseBtn").addEventListener("click", closeFindBar);
+el("replaceOneBtn").addEventListener("click", replaceActiveMatch);
+el("replaceAllBtn").addEventListener("click", replaceAllMatches);
+
+function findInEditor() { openFindBar(); }
 
 // ---------- toolbar actions ----------
 el("btnNew").addEventListener("click", async () => {
@@ -2602,6 +2711,103 @@ el("btnDownload").addEventListener("click", () => {
   URL.revokeObjectURL(a.href);
 });
 
+// ---------- project export (.zip) ----------
+// A minimal, dependency-free ZIP writer (STORE method — no compression, so it's
+// just CRC32 + the plain PK header/central-directory bookkeeping). Good enough for
+// bundling a handful of small source files; no need to pull in a real zip library.
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function dosDateTime(d) {
+  const time = ((d.getHours() & 31) << 11) | ((d.getMinutes() & 63) << 5) | ((d.getSeconds() >> 1) & 31);
+  const date = (((Math.max(0, d.getFullYear() - 1980)) & 127) << 9) | (((d.getMonth() + 1) & 15) << 5) | (d.getDate() & 31);
+  return { time, date };
+}
+function makeZip(entries) {
+  const enc = new TextEncoder();
+  const { time, date } = dosDateTime(new Date());
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+
+  entries.forEach(({ name, content }) => {
+    const nameBytes = enc.encode(name);
+    const data = enc.encode(content);
+    const crc = crc32(data);
+
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(6, 0, true);
+    local.setUint16(8, 0, true); // store, no compression
+    local.setUint16(10, time, true);
+    local.setUint16(12, date, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, data.length, true);
+    local.setUint32(22, data.length, true);
+    local.setUint16(26, nameBytes.length, true);
+    local.setUint16(28, 0, true);
+    chunks.push(new Uint8Array(local.buffer), nameBytes, data);
+
+    const centralEntry = new DataView(new ArrayBuffer(46));
+    centralEntry.setUint32(0, 0x02014b50, true);
+    centralEntry.setUint16(4, 20, true);
+    centralEntry.setUint16(6, 20, true);
+    centralEntry.setUint16(8, 0, true);
+    centralEntry.setUint16(10, 0, true);
+    centralEntry.setUint16(12, time, true);
+    centralEntry.setUint16(14, date, true);
+    centralEntry.setUint32(16, crc, true);
+    centralEntry.setUint32(20, data.length, true);
+    centralEntry.setUint32(24, data.length, true);
+    centralEntry.setUint16(28, nameBytes.length, true);
+    centralEntry.setUint16(30, 0, true);
+    centralEntry.setUint16(32, 0, true);
+    centralEntry.setUint16(34, 0, true);
+    centralEntry.setUint16(36, 0, true);
+    centralEntry.setUint32(38, 0, true);
+    centralEntry.setUint32(42, offset, true);
+    central.push(new Uint8Array(centralEntry.buffer), nameBytes);
+
+    offset += 30 + nameBytes.length + data.length;
+  });
+
+  const centralSize = central.reduce((s, p) => s + p.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(4, 0, true);
+  end.setUint16(6, 0, true);
+  end.setUint16(8, entries.length, true);
+  end.setUint16(10, entries.length, true);
+  end.setUint32(12, centralSize, true);
+  end.setUint32(16, offset, true);
+  end.setUint16(20, 0, true);
+
+  return new Blob([...chunks, ...central, new Uint8Array(end.buffer)], { type: "application/zip" });
+}
+
+function downloadProjectZip() {
+  const blob = makeZip(files.map(f => ({ name: f.name, content: f.content })));
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "adastudio-projekt.zip";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast(`Pobrano projekt (${files.length} ${files.length === 1 ? "plik" : "plików"}) jako .zip`, "ok");
+}
+el("btnDownloadZip").addEventListener("click", downloadProjectZip);
+
 el("btnFormat").addEventListener("click", () => {
   const f = getActive();
   if (!f) return;
@@ -2640,7 +2846,7 @@ el("fontSizeSelect").addEventListener("change", (e) => {
   document.documentElement.style.setProperty("--code-lh", (parseFloat(e.target.value) * 1.55) + "px");
 });
 
-const THEMES = ["dark", "light", "monokai", "nord", "solarized", "dracula", "onedark", "gruvbox", "tokyonight", "catppuccin", "githublight"];
+const THEMES = ["dark", "light", "monokai", "nord", "solarized", "dracula", "onedark", "gruvbox", "tokyonight", "catppuccin", "githublight", "rosepine", "ayu", "everforest", "synthwave", "nordlight"];
 function applyTheme(name) {
   theme = THEMES.includes(name) ? name : "dark";
   document.body.classList.remove(...THEMES.map(t => t));
@@ -2690,6 +2896,7 @@ function paletteActions() {
     { label: "Otwórz plik z dysku", hint: "", run: () => el("btnOpen").click() },
     { label: "Zapisz bieżący plik", hint: "Ctrl+S", run: saveCurrentFile },
     { label: "Pobierz plik", hint: "", run: () => el("btnDownload").click() },
+    { label: "Pobierz cały projekt (.zip)", hint: "", run: downloadProjectZip },
     { label: "Formatuj kod", hint: "", run: () => el("btnFormat").click() },
     { label: "Znajdź w pliku", hint: "Ctrl+F", run: findInEditor },
     { label: "Uruchom program", hint: "Ctrl+Enter", run: runCurrentFile },
@@ -2706,6 +2913,11 @@ function paletteActions() {
     { label: "Motyw: Tokyo Night", hint: "", run: () => applyTheme("tokyonight") },
     { label: "Motyw: Catppuccin", hint: "", run: () => applyTheme("catppuccin") },
     { label: "Motyw: GitHub Light", hint: "", run: () => applyTheme("githublight") },
+    { label: "Motyw: Rosé Pine", hint: "", run: () => applyTheme("rosepine") },
+    { label: "Motyw: Ayu", hint: "", run: () => applyTheme("ayu") },
+    { label: "Motyw: Everforest", hint: "", run: () => applyTheme("everforest") },
+    { label: "Motyw: Synthwave", hint: "", run: () => applyTheme("synthwave") },
+    { label: "Motyw: Nord Light", hint: "", run: () => applyTheme("nordlight") },
     { label: "Skomentuj / odkomentuj linię", hint: "Ctrl+/", run: toggleComment },
     { label: "Duplikuj wiersz", hint: "Ctrl+D", run: duplicateLine },
     { label: "Przesuń wiersz w górę", hint: "Alt+↑", run: () => moveLine(-1) },
@@ -2936,6 +3148,28 @@ function renderProblems() {
       body.appendChild(item);
     });
   }
+  renderErrorHighlights();
+}
+
+// Red line highlight(s) in the editor itself, for compile errors on the active file —
+// same idea as current-line-highlight, just keyed off `problems` instead of the caret.
+function renderErrorHighlights() {
+  const layer = el("errorLineLayer");
+  if (!layer) return;
+  layer.innerHTML = "";
+  const f = getActive();
+  if (!f) return;
+  const lh = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--code-lh")) || 21;
+  const linesSeen = new Set();
+  problems.filter(p => p.fileName === f.name && p.line != null).forEach(p => {
+    if (linesSeen.has(p.line)) return;
+    linesSeen.add(p.line);
+    const div = document.createElement("div");
+    div.className = "error-line-highlight";
+    div.style.top = `${(p.line - 1) * lh + 12}px`;
+    div.style.height = `${lh}px`;
+    layer.appendChild(div);
+  });
 }
 function jumpToProblem(p) {
   const f = files.find(x => x.name === p.fileName);

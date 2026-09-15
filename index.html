@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>AdaStudio — edytor Ady</title>
 <link rel="icon" href="data:," />
-<link rel="stylesheet" href="styles.css?v=6" />
+<link rel="stylesheet" href="styles.css?v=7" />
 </head>
 <body>
 <div id="app">
@@ -18,6 +18,7 @@
     <input type="file" id="fileInput" accept=".adb,.ads,.ada,.txt" style="display:none" multiple />
     <button class="toolbar-btn" id="btnSave">💾 Zapisz</button>
     <button class="toolbar-btn" id="btnDownload">⬇ Pobierz</button>
+    <button class="toolbar-btn" id="btnDownloadZip" title="Pobierz cały projekt jako .zip">📦 ZIP</button>
 
     <div class="toolbar-sep"></div>
 
@@ -45,6 +46,11 @@
       <option value="tokyonight">🌆 Tokyo Night</option>
       <option value="catppuccin">🐱 Catppuccin</option>
       <option value="githublight">🐙 GitHub Light</option>
+      <option value="rosepine">🌹 Rosé Pine</option>
+      <option value="ayu">🎐 Ayu</option>
+      <option value="everforest">🌲 Everforest</option>
+      <option value="synthwave">🌴 Synthwave</option>
+      <option value="nordlight">🧊 Nord Light</option>
     </select>
     <button class="toolbar-btn" id="btnPalette" title="Paleta poleceń">⌘ Polecenia (Ctrl+K)</button>
     <button class="toolbar-btn" id="btnSettings" title="Ustawienia">⚙ Ustawienia</button>
@@ -86,11 +92,27 @@
     <div class="editor-area">
       <div class="tabs" id="tabs"></div>
 
+      <div class="find-bar" id="findBar" hidden>
+        <div class="find-row">
+          <input id="findInput" placeholder="Znajdź" autocomplete="off" />
+          <span class="find-count" id="findCount">0/0</span>
+          <button id="findPrevBtn" title="Poprzedni (Shift+Enter)">↑</button>
+          <button id="findNextBtn" title="Następny (Enter)">↓</button>
+          <button id="findCloseBtn" title="Zamknij (Esc)">✕</button>
+        </div>
+        <div class="find-row">
+          <input id="replaceInput" placeholder="Zamień na" autocomplete="off" />
+          <button id="replaceOneBtn">Zamień</button>
+          <button id="replaceAllBtn">Zamień wszystko</button>
+        </div>
+      </div>
+
       <div class="editor-scroll" id="editorScroll">
         <div class="editor-wrap">
           <div class="gutter" id="gutter">1</div>
           <div class="code-stack">
             <div class="current-line-highlight" id="currentLineHighlight" hidden></div>
+            <div class="error-line-layer" id="errorLineLayer"></div>
             <pre id="highlightLayer"><code></code></pre>
             <textarea id="codeInput" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"></textarea>
             <div class="autocomplete" id="autocompletePopup" hidden></div>
@@ -198,6 +220,6 @@
 <!-- Toast notifications -->
 <div class="toast-stack" id="toastStack"></div>
 
-<script src="app.js?v=12"></script>
+<script src="app.js?v=13"></script>
 </body>
 </html>
