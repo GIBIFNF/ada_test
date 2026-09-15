@@ -166,6 +166,13 @@ class AdaRecord {
   set(name, val) { this.values.set(name.toLowerCase(), val); }
 }
 
+// Backs Ada.Containers.Vectors' Vector type — a plain growable array. Real Ada tracks
+// an Index_Type/Element_Type per instantiation; we don't type-check element contents,
+// so one class serves every instantiation regardless of its generic parameters.
+class AdaVector {
+  constructor() { this.items = []; }
+}
+
 class AdaEnum {
   constructor(typeName, name, ordinal) {
     this.typeName = typeName;
@@ -439,6 +446,10 @@ class Parser {
     this.next(); // 'type' or 'subtype'
     const name = this.expectIdent();
     this.expectKeyword("is");
+    if (this.atKeyword("tagged") || this.atKeyword("abstract") || this.atKeyword("interface")) {
+      const t = this.peek();
+      throw new AdaError(`tagged types / inheritance ("${t.value}") are not supported by this mini-interpreter`, t.line, t.col);
+    }
     if (this.atOp("(")) {
       this.next();
       const literals = [this.expectIdent()];
@@ -496,6 +507,40 @@ class Parser {
         decls.push(this.parseTypeDecl());
         continue;
       }
+      if (this.atKeyword("use")) {
+        // A "use Package;" (or "use type T;") clause inside the declarative part, not
+        // just at the top of the file — e.g. right after a generic package instantiation.
+        // We don't scope names to packages at all, so this is parsed and discarded.
+        this.next();
+        if (this.atKeyword("type")) this.next();
+        this.expectIdent();
+        while (this.atOp(".")) { this.next(); this.expectIdent(); }
+        this.expectOp(";");
+        continue;
+      }
+      if (this.atKeyword("package")) {
+        // Generic package instantiation, e.g.
+        // "package Int_Vectors is new Ada.Containers.Vectors(Natural, Integer);" — we
+        // don't model packages/generics for real, so this is parsed and discarded:
+        // "Vector", Append/Element/etc are already universal builtins (see execCall/
+        // evalExpr), so no registration is needed for the instantiation to work.
+        this.next();
+        this.expectIdent(); // package name
+        this.expectKeyword("is");
+        this.expectKeyword("new");
+        this.expectIdent();
+        while (this.atOp(".")) { this.next(); this.expectIdent(); }
+        if (this.atOp("(")) {
+          let depth = 0;
+          do {
+            const t = this.next();
+            if (t.type === "op" && t.value === "(") depth++;
+            else if (t.type === "op" && t.value === ")") depth--;
+          } while (depth > 0);
+        }
+        this.expectOp(";");
+        continue;
+      }
       const names = [this.expectIdent()];
       while (this.atOp(",")) { this.next(); names.push(this.expectIdent()); }
       this.expectOp(":");
@@ -514,6 +559,9 @@ class Parser {
         arrayType = { low, high, elemType };
       } else {
         typeName = this.expectIdent();
+        // Discard package qualifiers on the type name ("Int_Vectors.Vector" -> "Vector") —
+        // we don't scope types to packages, so only the last segment matters.
+        while (this.atOp(".")) { this.next(); typeName = this.expectIdent(); }
       }
       let init = null;
       if (this.atOp(":=")) {
@@ -652,8 +700,25 @@ class Parser {
         this.expectOp(";");
         return { kind: "pathassign", name, path, expr, line: nameTok.line, col: nameTok.col };
       }
+      // Could be a prefixed/OOP-style call ("V.Append(10);" == "Append(V, 10);", where V
+      // is a real variable) or a fully package-qualified call ("Ada.Text_IO.Put_Line(x);",
+      // where "Ada" isn't a variable at all — just a namespace we don't track). Which one
+      // it is can't be told apart here (no symbol table during parsing), so both the
+      // receiver and the plain-qualified-call args are kept and the decision is made at
+      // runtime, in execStatement's "dotcall" case, based on whether `name` actually
+      // resolves to a variable.
+      const method = path[path.length - 1].field;
+      const args = [];
+      if (this.atOp("(")) {
+        this.next();
+        if (!this.atOp(")")) {
+          args.push(this.parseCallArg());
+          while (this.atOp(",")) { this.next(); args.push(this.parseCallArg()); }
+        }
+        this.expectOp(")");
+      }
       this.expectOp(";");
-      return { kind: "null" };
+      return { kind: "dotcall", name, path, method, args, line: nameTok.line, col: nameTok.col };
     }
 
     if (this.atOp(":=")) {
@@ -752,6 +817,17 @@ class Parser {
   parseFor() {
     this.next(); // for
     const varName = this.expectIdent();
+    if (this.atKeyword("of")) {
+      // "for X of Container loop ... end loop;" — element iteration (Vector, array).
+      this.next();
+      const container = this.parseExpr();
+      this.expectKeyword("loop");
+      const body = this.parseStatements(["end"]);
+      this.expectKeyword("end");
+      this.expectKeyword("loop");
+      this.expectOp(";");
+      return { kind: "forof", varName, container, body };
+    }
     this.expectKeyword("in");
     let reverse = false;
     if (this.atKeyword("reverse")) { reverse = true; this.next(); }
@@ -992,6 +1068,17 @@ const TIME_FUNCTIONS = {
   minutes: (n) => n * 60000,
 };
 
+// Ada.Characters.Handling / Ada.Strings.Fixed / Ada.Strings.Unbounded. Unbounded_String
+// is just a plain JS string here (same representation as String), so To_Unbounded_String
+// and To_String are identity — there's nothing to convert.
+const STRING_FUNCTIONS = {
+  to_upper: (s) => String(s).toUpperCase(),
+  to_lower: (s) => String(s).toLowerCase(),
+  to_unbounded_string: (s) => String(s),
+  to_string: (s) => String(s),
+  index: (s, pat) => { const i = String(s).indexOf(String(pat)); return i === -1 ? 0 : i + 1; },
+};
+
 class Interpreter {
   constructor(onOutput) {
     this.onOutput = onOutput || (() => {});
@@ -1108,8 +1195,9 @@ class Interpreter {
     if (["integer", "natural", "positive", "long_integer", "short_integer"].includes(t)) return 0;
     if (t === "float") return 0.0;
     if (t === "boolean") return false;
-    if (t === "string") return "";
+    if (t === "string" || t === "unbounded_string") return "";
     if (t === "character") return " ";
+    if (t === "vector") return new AdaVector();
     return null;
   }
 
@@ -1239,6 +1327,21 @@ class Interpreter {
       case "call":
         yield* this.execCall(s.name, s.args, env, s.line, s.col);
         return;
+      case "dotcall": {
+        if (env.getVarEntry(s.name)) {
+          // OOP-style call on a real value: "V.Append(10)" -> "Append(V, 10)"
+          const receiver = s.path.slice(0, -1).reduce(
+            (e, seg) => ({ kind: "field", expr: e, field: seg.field }),
+            { kind: "var", name: s.name, line: s.line, col: s.col }
+          );
+          yield* this.execCall(s.method, [{ name: null, expr: receiver }, ...s.args], env, s.line, s.col);
+        } else {
+          // Fully package-qualified call, e.g. "Ada.Text_IO.Put_Line(x)" — "Ada"/"Text_IO"
+          // aren't variables we track, so just call the last segment directly.
+          yield* this.execCall(s.method, s.args, env, s.line, s.col);
+        }
+        return;
+      }
       case "if": {
         for (const b of s.branches) {
           if (this.evalExpr(b.cond, env) === true) { yield* this.execStatements(b.body, env); return; }
@@ -1284,6 +1387,23 @@ class Interpreter {
           } else {
             for (let i = from; i <= to; i++) { entry.value = i; yield* this.execStatements(s.body, env); }
           }
+        } catch (err) {
+          if (!(err instanceof LoopExitSignal)) throw err;
+        }
+        if (prevEntry) env.vars.set(s.varName.toLowerCase(), prevEntry); else env.vars.delete(s.varName.toLowerCase());
+        return;
+      }
+      case "forof": {
+        const container = this.evalExpr(s.container, env);
+        const items = container instanceof AdaVector ? container.items
+          : container instanceof AdaArray ? container.items
+          : typeof container === "string" ? [...container]
+          : (() => { throw new AdaError(`cannot iterate "for ... of" over this value`, s.line, s.col); })();
+        const prevEntry = env.vars.get(s.varName.toLowerCase());
+        env.setVarEntry(s.varName, { type: null, value: undefined, constant: false });
+        const entry = env.vars.get(s.varName.toLowerCase());
+        try {
+          for (const item of items) { entry.value = item; yield* this.execStatements(s.body, env); }
         } catch (err) {
           if (!(err instanceof LoopExitSignal)) throw err;
         }
@@ -1395,6 +1515,28 @@ class Interpreter {
         entry.value = raw;
       }
       return;
+    }
+    // Ada.Containers.Vectors procedures (mutate the Vector object in place — it's a
+    // reference type here, so no out-parameter machinery is needed) and
+    // Ada.Strings.Unbounded.Append (Source is a plain var holding a string, so we
+    // write back through its Env entry the same way Get/Get_Line do above).
+    if (lname === "append" && args.length >= 2) {
+      const recvExpr = args[0].expr;
+      const recv = recvExpr && this.evalExpr(recvExpr, env);
+      if (recv instanceof AdaVector) { recv.items.push(this.evalExpr(args[1].expr, env)); return; }
+      if (recvExpr && recvExpr.kind === "var" && typeof recv === "string") {
+        const entry = env.getVarEntry(recvExpr.name);
+        entry.value = recv + this.stringify(this.evalExpr(args[1].expr, env));
+        return;
+      }
+    }
+    if (lname === "clear" && args.length) {
+      const recv = this.evalExpr(args[0].expr, env);
+      if (recv instanceof AdaVector) { recv.items.length = 0; return; }
+    }
+    if (lname === "delete_last" && args.length) {
+      const recv = this.evalExpr(args[0].expr, env);
+      if (recv instanceof AdaVector) { recv.items.pop(); return; }
     }
     const sub = env.getSub(name);
     if (sub) { yield* this.callSub(sub, args, env); return; }
@@ -1513,10 +1655,33 @@ class Interpreter {
         if (e.attr === "Image") return this.imageOf(v);
         if (e.attr === "Round" && typeof v === "number") return adaRound(v);
         if (e.attr === "Truncation" && typeof v === "number") return Math.trunc(v);
+        if (e.attr === "Succ" || e.attr === "Pred") {
+          const delta = e.attr === "Succ" ? 1 : -1;
+          if (v instanceof AdaEnum) {
+            const typeDef = env.getType(v.typeName);
+            const next = typeDef && typeDef.literalValues[v.ordinal + delta];
+            if (!next) throw new AdaError(`raised CONSTRAINT_ERROR`, e.line, e.col);
+            return next;
+          }
+          if (typeof v === "number") return v + delta;
+        }
         return v;
       }
       case "attrcall": {
         const argv = e.args.map(a => this.evalExpr(a.expr, env));
+        if (e.attr === "Min") return Math.min(argv[0], argv[1]);
+        if (e.attr === "Max") return Math.max(argv[0], argv[1]);
+        if (e.attr === "Succ" || e.attr === "Pred") {
+          const delta = e.attr === "Succ" ? 1 : -1;
+          const val = argv[0];
+          if (val instanceof AdaEnum) {
+            const typeDef = env.getType(val.typeName);
+            const next = typeDef && typeDef.literalValues[val.ordinal + delta];
+            if (!next) throw new AdaError(`raised CONSTRAINT_ERROR`, e.line, e.col);
+            return next;
+          }
+          return val + delta;
+        }
         if (e.attr === "Val") {
           const typeDef = e.expr.kind === "var" ? env.getType(e.expr.name) : null;
           if (typeDef && typeDef.kind === "enum") return typeDef.literalValues[argv[0]];
@@ -1537,6 +1702,13 @@ class Interpreter {
               throw new AdaError(`raised CONSTRAINT_ERROR : index check failed`, e.line, e.col);
             }
             return entry.value.items[idx - entry.value.low];
+          }
+          if (entry.value instanceof AdaVector) {
+            const idx = this.evalExpr(e.args[0].expr, env); // 0-based, matching Index_Type => Natural
+            if (idx < 0 || idx >= entry.value.items.length) {
+              throw new AdaError(`raised CONSTRAINT_ERROR : index check failed`, e.line, e.col);
+            }
+            return entry.value.items[idx];
           }
           if (typeof entry.value === "string") {
             const idx = this.evalExpr(e.args[0].expr, env);
@@ -1559,6 +1731,31 @@ class Interpreter {
         }
         if (lname === "float" || lname === "long_float") {
           return e.args.length ? this.evalExpr(e.args[0].expr, env) : 0.0;
+        }
+        // Ada.Containers.Vectors functions — dispatch on the runtime value so "Length"
+        // works uniformly for both a Vector and a String (Ada.Strings has Length too).
+        if (["element", "first_element", "last_element", "length", "is_empty", "first_index", "last_index"].includes(lname) && e.args.length) {
+          const v = this.evalExpr(e.args[0].expr, env);
+          if (v instanceof AdaVector) {
+            if (lname === "element") return v.items[this.evalExpr(e.args[1].expr, env)];
+            if (lname === "first_element") return v.items[0];
+            if (lname === "last_element") return v.items[v.items.length - 1];
+            if (lname === "length") return v.items.length;
+            if (lname === "is_empty") return v.items.length === 0;
+            if (lname === "first_index") return 0;
+            if (lname === "last_index") return v.items.length - 1;
+          }
+          if (typeof v === "string" && lname === "length") return v.length;
+        }
+        if (lname === "trim" && e.args.length) {
+          // the (optional) 2nd arg is normally Ada.Strings.Left/Right/Both — we always
+          // trim both ends, and deliberately never evaluate that arg (it's rarely declared
+          // in student programs, and we don't need its value anyway).
+          return String(this.evalExpr(e.args[0].expr, env)).trim();
+        }
+        if (STRING_FUNCTIONS[lname]) {
+          const argv = e.args.map(a => this.evalExpr(a.expr, env));
+          return STRING_FUNCTIONS[lname](...argv);
         }
         if (MATH_FUNCTIONS[lname]) {
           const argv = e.args.map(a => this.evalExpr(a.expr, env));
@@ -1678,6 +1875,10 @@ const ADA_HELP = {
   get: "Get(Zmienna) — czyta wartość ze standardowego wejścia (terminal) i przypisuje ją do zmiennej.",
   delay: "delay D; — czeka D sekund. delay until T; — czeka aż nadejdzie czas T (Ada.Real_Time.Time). Naprawdę czeka w czasie rzeczywistym.",
   clock: "Ada.Real_Time.Clock — funkcja bezparametrowa zwracająca bieżący czas (Time). Użycie: Zmienna := Clock;",
+  vector: "Ada.Containers.Vectors: V : Vector; V.Append(X) (albo Append(V,X)); Element(V,I); First_Element/Last_Element(V); Length(V); Clear(V); for X of V loop.",
+  unbounded_string: "Ada.Strings.Unbounded: To_Unbounded_String(S), To_String(U), Append(U, S), Length(U). Działa jak zwykły String.",
+  to_upper: "Ada.Characters.Handling.To_Upper(S) — zamienia na wielkie litery (działa dla String i Character).",
+  trim: "Ada.Strings.Fixed.Trim(S) — usuwa białe znaki z obu końców łańcucha.",
   get_line: "Get_Line(Zmienna : String) — czyta cały wiersz tekstu ze standardowego wejścia.",
   "integer'image": "Integer'Image(X) — zamienia liczbę całkowitą na String (ze spacją wiodącą dla liczb dodatnich).",
   "'round": "X'Round — zaokrągla Float do najbliższej liczby całkowitej (przy remisie: od zera). Integer(X) robi to samo.",
@@ -1717,7 +1918,7 @@ const ADA_PACKAGES = [
 ];
 
 // Only attributes the mini-interpreter actually evaluates (see interpreter.js evalExpr "attr"/"attrcall").
-const ADA_ATTRIBUTES = ["Image", "Value", "First", "Last", "Length", "Val", "Pos", "Round", "Truncation"];
+const ADA_ATTRIBUTES = ["Image", "Value", "First", "Last", "Length", "Val", "Pos", "Round", "Truncation", "Succ", "Pred", "Min", "Max"];
 
 // Only the subprograms execCall() actually knows how to run.
 const ADA_BUILTINS = [
