@@ -2045,9 +2045,23 @@ function saveState() {
   localStorage.setItem("adastudio.files", JSON.stringify({ files, nextId, activeId }));
 }
 
+let snippetsVisible = true;
+
 function loadSettings() {
   hardcoreMode = localStorage.getItem("adastudio.hardcore") === "1";
   autocompleteEnabled = hardcoreMode ? false : localStorage.getItem("adastudio.autocomplete") !== "0";
+  snippetsVisible = localStorage.getItem("adastudio.snippets") !== "0";
+}
+
+function applySnippetsVisibility() {
+  el("snippetSection").hidden = !snippetsVisible;
+  const toggle = el("toggleSnippets");
+  if (toggle) toggle.checked = snippetsVisible;
+}
+function setSnippetsVisible(visible) {
+  snippetsVisible = visible;
+  localStorage.setItem("adastudio.snippets", visible ? "1" : "0");
+  applySnippetsVisibility();
 }
 
 // ---------- file helpers ----------
@@ -2641,6 +2655,7 @@ function openSettings() {
   el("toggleAutocomplete").checked = autocompleteEnabled;
   el("toggleAutocomplete").disabled = hardcoreMode;
   el("toggleHardcore").checked = hardcoreMode;
+  el("toggleSnippets").checked = snippetsVisible;
   el("settingsOverlay").hidden = false;
 }
 function closeSettings() { el("settingsOverlay").hidden = true; }
@@ -2663,6 +2678,9 @@ el("toggleHardcore").addEventListener("change", (e) => {
   el("toggleAutocomplete").disabled = hardcoreMode;
   toast(hardcoreMode ? "Tryb hardcore włączony — podpowiedzi wyłączone" : "Tryb hardcore wyłączony", "ok");
 });
+
+el("toggleSnippets").addEventListener("change", (e) => setSnippetsVisible(e.target.checked));
+el("btnHideSnippets").addEventListener("click", () => { setSnippetsVisible(false); toast('Ukryto panel "Wstaw fragment" — włączysz go z powrotem w Ustawieniach', "ok"); });
 
 // ---------- command palette ----------
 function paletteActions() {
@@ -2694,6 +2712,7 @@ function paletteActions() {
     { label: "Przesuń wiersz w dół", hint: "Alt+↓", run: () => moveLine(1) },
     { label: "Ustawienia", hint: "", run: openSettings },
     { label: autocompleteEnabled ? "Wyłącz podpowiedzi" : "Włącz podpowiedzi", hint: "", run: () => el("toggleAutocomplete").click() },
+    { label: snippetsVisible ? 'Ukryj panel "Wstaw fragment"' : 'Pokaż panel "Wstaw fragment"', hint: "", run: () => setSnippetsVisible(!snippetsVisible) },
   ];
 }
 
@@ -3290,5 +3309,6 @@ document.documentElement.style.setProperty("--code-size", "13.5px");
 document.documentElement.style.setProperty("--code-lh", "21px");
 renderAll();
 renderSnippets();
+applySnippetsVisibility();
 renderProblems();
 bootTerminal();

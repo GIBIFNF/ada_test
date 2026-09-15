@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>AdaStudio — edytor Ady</title>
 <link rel="icon" href="data:," />
-<link rel="stylesheet" href="styles.css?v=5" />
+<link rel="stylesheet" href="styles.css?v=6" />
 </head>
 <body>
 <div id="app">
@@ -63,8 +63,8 @@
       </div>
       <div class="file-list" id="fileList"></div>
 
-      <div class="sidebar-section">
-        <h4>Wstaw fragment</h4>
+      <div class="sidebar-section" id="snippetSection">
+        <h4>Wstaw fragment <button id="btnHideSnippets" title="Ukryj panel">✕</button></h4>
         <div id="snippetList"></div>
       </div>
 
@@ -179,6 +179,16 @@
         <span class="toggle-slider"></span>
       </span>
     </label>
+    <label class="settings-row">
+      <div class="settings-row-text">
+        <span>Panel "Wstaw fragment"</span>
+        <small>Lista gotowych fragmentów kodu w panelu bocznym. Możesz go też ukryć klikając ✕ przy jego nagłówku.</small>
+      </div>
+      <span class="toggle-switch">
+        <input type="checkbox" id="toggleSnippets" checked />
+        <span class="toggle-slider"></span>
+      </span>
+    </label>
     <div class="modal-buttons">
       <button class="toolbar-btn primary" id="settingsClose">Zamknij</button>
     </div>
@@ -188,6 +198,6 @@
 <!-- Toast notifications -->
 <div class="toast-stack" id="toastStack"></div>
 
-<script src="app.js?v=11"></script>
+<script src="app.js?v=12"></script>
 </body>
 </html>
