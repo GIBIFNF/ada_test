@@ -183,6 +183,40 @@ function ordinalOf(v) { return v instanceof AdaEnum ? v.ordinal : v; }
 // JS Math.round, which rounds -2.5 to -2 instead of -3.
 function adaRound(x) { return x < 0 ? -Math.round(-x) : Math.round(x); }
 
+// Resolves a call's arguments — parsed as {name, expr}[], some possibly named
+// ("Item => X") — against an ordered list of parameter names, Ada-style: positional
+// arguments fill left-to-right, named ones fill by name, and a named argument can't
+// be followed by a positional one. Returns an array of expr nodes (or undefined for
+// any parameter nothing was passed for), aligned to `paramNames`.
+// Ada.Float_Text_IO / Ada.Integer_Text_IO-style Put(Item, Fore, Aft, Exp): Aft digits
+// after the decimal point, Exp = 0 for plain fixed notation (student programs never
+// ask for real scientific notation here), Fore = minimum digit width before the point.
+function formatAdaFloat(v, fore, aft, exp) {
+  if (exp && exp > 0) return v.toExponential(aft);
+  const sign = v < 0 ? "-" : "";
+  const fixed = Math.abs(v).toFixed(Math.max(0, aft));
+  const [intPart, fracPart] = fixed.split(".");
+  const body = intPart.padStart(Math.max(0, fore), " ") + (fracPart !== undefined ? "." + fracPart : "");
+  return sign + body;
+}
+
+function resolveArgs(paramNames, args) {
+  const result = new Array(paramNames.length).fill(undefined);
+  let sawNamed = false;
+  args.forEach((a, i) => {
+    if (a.name != null) {
+      sawNamed = true;
+      const idx = paramNames.findIndex(p => p.toLowerCase() === a.name.toLowerCase());
+      if (idx === -1) throw new AdaError(`no parameter named "${a.name}" here`);
+      result[idx] = a.expr;
+    } else {
+      if (sawNamed) throw new AdaError(`positional parameter association cannot follow a named association`);
+      result[i] = a.expr;
+    }
+  });
+  return result;
+}
+
 class Lexer {
   constructor(src) {
     this.src = src;
@@ -529,6 +563,17 @@ class Parser {
     return stmts;
   }
 
+  // One call argument: either positional ("Expr") or named ("Name => Expr", as in
+  // `Put(Item => X, Fore => 1, Aft => 2, Exp => 0)`).
+  parseCallArg() {
+    if (this.peek().type === "ident" && this.peek(1).type === "op" && this.peek(1).value === "=>") {
+      const name = this.expectIdent();
+      this.expectOp("=>");
+      return { name, expr: this.parseExpr() };
+    }
+    return { name: null, expr: this.parseExpr() };
+  }
+
   parseStatement() {
     if (this.atKeyword("if")) return this.parseIf();
     if (this.atKeyword("for")) return this.parseFor();
@@ -557,6 +602,14 @@ class Parser {
       this.expectOp(";");
       return { kind: "raise", excName, msg, line: t.line, col: t.col };
     }
+    if (this.atKeyword("delay")) {
+      const t = this.next();
+      let until = false;
+      if (this.atKeyword("until")) { this.next(); until = true; }
+      const expr = this.parseExpr();
+      this.expectOp(";");
+      return { kind: "delay", until, expr, line: t.line, col: t.col };
+    }
     if (this.atKeyword("exit")) {
       this.next();
       let cond = null;
@@ -573,8 +626,8 @@ class Parser {
       this.next();
       const args = [];
       if (!this.atOp(")")) {
-        args.push(this.parseExpr());
-        while (this.atOp(",")) { this.next(); args.push(this.parseExpr()); }
+        args.push(this.parseCallArg());
+        while (this.atOp(",")) { this.next(); args.push(this.parseCallArg()); }
       }
       this.expectOp(")");
       const path = [{ type: "index", args }];
@@ -822,8 +875,8 @@ class Parser {
           this.next();
           const args = [];
           if (!this.atOp(")")) {
-            args.push(this.parseExpr());
-            while (this.atOp(",")) { this.next(); args.push(this.parseExpr()); }
+            args.push(this.parseCallArg());
+            while (this.atOp(",")) { this.next(); args.push(this.parseCallArg()); }
           }
           this.expectOp(")");
           expr = { kind: "attrcall", expr, attr, args };
@@ -861,8 +914,8 @@ class Parser {
         this.next();
         const args = [];
         if (!this.atOp(")")) {
-          args.push(this.parseExpr());
-          while (this.atOp(",")) { this.next(); args.push(this.parseExpr()); }
+          args.push(this.parseCallArg());
+          while (this.atOp(",")) { this.next(); args.push(this.parseCallArg()); }
         }
         this.expectOp(")");
         return { kind: "funcall", name, args, line: t.line, col: t.col };
@@ -928,6 +981,15 @@ const MATH_FUNCTIONS = {
   arctan: Math.atan,
   log: (x, base) => (base == null ? Math.log(x) : Math.log(x) / Math.log(base)),
   exp: Math.exp,
+};
+
+// Ada.Real_Time: Time and Time_Span are both represented as plain milliseconds
+// (Clock, above in evalExpr's "var" case, returns Date.now()), so these conversions
+// just scale into that same unit.
+const TIME_FUNCTIONS = {
+  milliseconds: (n) => n,
+  seconds: (n) => n * 1000,
+  minutes: (n) => n * 60000,
 };
 
 class Interpreter {
@@ -1101,12 +1163,12 @@ class Interpreter {
   stepInto(value, seg, env, line, col) {
     if (seg.type === "index") {
       if (value instanceof AdaArray) {
-        const idx = this.evalExpr(seg.args[0], env);
+        const idx = this.evalExpr(seg.args[0].expr, env);
         if (idx < value.low || idx > value.high) throw new AdaError(`raised CONSTRAINT_ERROR : index check failed`, line, col);
         return value.items[idx - value.low];
       }
       if (typeof value === "string") {
-        const idx = this.evalExpr(seg.args[0], env);
+        const idx = this.evalExpr(seg.args[0].expr, env);
         if (idx < 1 || idx > value.length) throw new AdaError(`raised CONSTRAINT_ERROR : index check failed`, line, col);
         return value[idx - 1];
       }
@@ -1159,7 +1221,7 @@ class Interpreter {
         const last = s.path[s.path.length - 1];
         if (last.type === "index") {
           if (!(current instanceof AdaArray)) throw new AdaError(`cannot index this value`, s.line, s.col);
-          const idx = this.evalExpr(last.args[0], env);
+          const idx = this.evalExpr(last.args[0].expr, env);
           if (idx < current.low || idx > current.high) throw new AdaError(`raised CONSTRAINT_ERROR : index check failed`, s.line, s.col);
           const targetCurrent = current.items[idx - current.low];
           current.items[idx - current.low] = s.expr.kind === "aggregate"
@@ -1260,6 +1322,14 @@ class Interpreter {
         if (s.cond == null || this.evalExpr(s.cond, env) === true) throw new LoopExitSignal();
         return;
       }
+      case "delay": {
+        const target = this.evalExpr(s.expr, env);
+        // `delay until T;` (Ada.Real_Time.Time, ms since epoch, matching Clock below) vs
+        // plain `delay D;` (a Duration in seconds, per RM 9.6).
+        const ms = s.until ? target - Date.now() : target * 1000;
+        yield { __delayRequest: true, ms: Math.max(0, ms) };
+        return;
+      }
       default:
         throw new AdaError(`unsupported statement: ${s.kind}`);
     }
@@ -1268,12 +1338,27 @@ class Interpreter {
   *execCall(name, args, env, line, col) {
     const lname = name.toLowerCase();
     if (lname === "put_line") {
+      const [item] = resolveArgs(["Item"], args);
       this.flushLine();
-      this.onOutput(this.stringify(this.evalExpr(args[0], env)));
+      this.onOutput(this.stringify(this.evalExpr(item, env)));
       return;
     }
     if (lname === "put") {
-      this.line += this.stringify(this.evalExpr(args[0], env));
+      // Ada.Text_IO.Put(Item) and the Ada.Float_Text_IO/Integer_Text_IO formatted
+      // Put(Item, Fore, Aft, Exp) share a name in real Ada via overloading; here we
+      // just switch on whether Fore/Aft/Exp were actually supplied.
+      const [item, fore, aft, exp] = resolveArgs(["Item", "Fore", "Aft", "Exp"], args);
+      const v = this.evalExpr(item, env);
+      if (fore !== undefined || aft !== undefined || exp !== undefined) {
+        this.line += formatAdaFloat(
+          v,
+          fore !== undefined ? this.evalExpr(fore, env) : 2,
+          aft !== undefined ? this.evalExpr(aft, env) : 2,
+          exp !== undefined ? this.evalExpr(exp, env) : 3
+        );
+      } else {
+        this.line += this.stringify(v);
+      }
       return;
     }
     if (lname === "new_line") {
@@ -1289,11 +1374,12 @@ class Interpreter {
       return; // no-op: Get() here always consumes one full line already
     }
     if (lname === "get" || lname === "get_line") {
-      if (!args.length || args[0].kind !== "var") {
+      const [itemArg] = resolveArgs(["Item"], args);
+      if (!itemArg || itemArg.kind !== "var") {
         throw new AdaError(`Get/Get_Line here only supports a plain variable argument`, line, col);
       }
-      const entry = env.getVarEntry(args[0].name);
-      if (!entry) throw new AdaError(`"${args[0].name}" is undefined`, line, col);
+      const entry = env.getVarEntry(itemArg.name);
+      if (!entry) throw new AdaError(`"${itemArg.name}" is undefined`, line, col);
       if (entry.constant) throw new AdaError(`left hand side of assignment must not be constant`, line, col);
       this.flushLine(); // show any prompt text already Put() on this line before waiting on stdin
       const raw = (yield { __inputRequest: true }).trim();
@@ -1315,8 +1401,9 @@ class Interpreter {
     throw new AdaError(`"${name}" is undefined`, line, col);
   }
 
-  *callSub(sub, argExprs, callerEnv) {
-    if (argExprs.length !== sub.params.length) {
+  *callSub(sub, args, callerEnv) {
+    const argExprs = resolveArgs(sub.params.map(p => p.name), args);
+    if (argExprs.some(a => a === undefined)) {
       throw new AdaError(`wrong number of arguments to "${sub.name}"`);
     }
     const newEnv = new Env(sub.closureEnv);
@@ -1394,8 +1481,10 @@ class Interpreter {
       case "lit": return e.value;
       case "var": {
         const entry = env.getVarEntry(e.name);
-        if (!entry) throw new AdaError(`"${e.name}" is undefined`, e.line, e.col);
-        return entry.value;
+        if (entry) return entry.value;
+        // Ada.Real_Time.Clock is a parameterless function, callable bare (no "()")
+        if (e.name.toLowerCase() === "clock") return Date.now();
+        throw new AdaError(`"${e.name}" is undefined`, e.line, e.col);
       }
       case "field": {
         const v = this.evalExpr(e.expr, env);
@@ -1427,7 +1516,7 @@ class Interpreter {
         return v;
       }
       case "attrcall": {
-        const argv = e.args.map(a => this.evalExpr(a, env));
+        const argv = e.args.map(a => this.evalExpr(a.expr, env));
         if (e.attr === "Val") {
           const typeDef = e.expr.kind === "var" ? env.getType(e.expr.name) : null;
           if (typeDef && typeDef.kind === "enum") return typeDef.literalValues[argv[0]];
@@ -1443,14 +1532,14 @@ class Interpreter {
         const entry = env.getVarEntry(e.name);
         if (entry && e.args.length === 1) {
           if (entry.value instanceof AdaArray) {
-            const idx = this.evalExpr(e.args[0], env);
+            const idx = this.evalExpr(e.args[0].expr, env);
             if (idx < entry.value.low || idx > entry.value.high) {
               throw new AdaError(`raised CONSTRAINT_ERROR : index check failed`, e.line, e.col);
             }
             return entry.value.items[idx - entry.value.low];
           }
           if (typeof entry.value === "string") {
-            const idx = this.evalExpr(e.args[0], env);
+            const idx = this.evalExpr(e.args[0].expr, env);
             if (idx < 1 || idx > entry.value.length) {
               throw new AdaError(`raised CONSTRAINT_ERROR : index check failed`, e.line, e.col);
             }
@@ -1465,15 +1554,19 @@ class Interpreter {
         }
         if (["integer", "natural", "positive", "long_integer", "short_integer"].includes(lname)) {
           if (!e.args.length) return 0;
-          const v = this.evalExpr(e.args[0], env);
+          const v = this.evalExpr(e.args[0].expr, env);
           return typeof v === "number" ? adaRound(v) : v; // Integer(3.7) rounds to 4, per RM 4.6
         }
         if (lname === "float" || lname === "long_float") {
-          return e.args.length ? this.evalExpr(e.args[0], env) : 0.0;
+          return e.args.length ? this.evalExpr(e.args[0].expr, env) : 0.0;
         }
         if (MATH_FUNCTIONS[lname]) {
-          const argv = e.args.map(a => this.evalExpr(a, env));
+          const argv = e.args.map(a => this.evalExpr(a.expr, env));
           return MATH_FUNCTIONS[lname](...argv);
+        }
+        if (TIME_FUNCTIONS[lname]) {
+          const argv = e.args.map(a => this.evalExpr(a.expr, env));
+          return TIME_FUNCTIONS[lname](...argv);
         }
         throw new AdaError(`"${e.name}" is undefined`, e.line, e.col);
       }
@@ -1512,14 +1605,14 @@ class Interpreter {
   }
 }
 
-// Drives a statement/call generator to completion, forwarding each Get/Get_Line
-// pause to `onNeedInput` and feeding its (awaited) answer back in.
+// Drives a statement/call generator to completion, forwarding each pause (Get/Get_Line,
+// or a `delay`) to `onNeedInput` and feeding its (awaited) answer back in.
 async function driveGenerator(gen, onNeedInput) {
   let sent;
   for (;;) {
     const { value, done } = gen.next(sent);
     if (done) return value;
-    sent = await onNeedInput();
+    sent = await onNeedInput(value);
   }
 }
 
@@ -1583,6 +1676,8 @@ const ADA_HELP = {
   put: "Put(S : String) — wypisuje tekst bez przejścia do nowej linii.",
   new_line: "New_Line — wypisuje pusty wiersz.",
   get: "Get(Zmienna) — czyta wartość ze standardowego wejścia (terminal) i przypisuje ją do zmiennej.",
+  delay: "delay D; — czeka D sekund. delay until T; — czeka aż nadejdzie czas T (Ada.Real_Time.Time). Naprawdę czeka w czasie rzeczywistym.",
+  clock: "Ada.Real_Time.Clock — funkcja bezparametrowa zwracająca bieżący czas (Time). Użycie: Zmienna := Clock;",
   get_line: "Get_Line(Zmienna : String) — czyta cały wiersz tekstu ze standardowego wejścia.",
   "integer'image": "Integer'Image(X) — zamienia liczbę całkowitą na String (ze spacją wiodącą dla liczb dodatnich).",
   "'round": "X'Round — zaokrągla Float do najbliższej liczby całkowitej (przy remisie: od zera). Integer(X) robi to samo.",
@@ -2514,16 +2609,23 @@ function compilerErrorLine(fileName, err) {
 function readsInput(source) { return /\b(get|get_line)\s*\(/i.test(source); }
 function parseCheck(source) { new Parser(new Lexer(source).tokens).parseProgram(); }
 
-// Stdin for a program that isn't actually being watched (a plain compile-check,
-// or `gprbuild`ing every file) — Get/Get_Line get an instant dummy answer instead
-// of blocking, so background checks never hang waiting for a terminal that isn't shown.
-function dummyStdin() { return Promise.resolve("0"); }
+// Stdin/delay handling for a program that isn't actually being watched (a plain
+// compile-check, or `gprbuild`ing every file) — Get/Get_Line get an instant dummy
+// answer and `delay` doesn't actually wait, so background checks never hang or
+// take real wall-clock time for a terminal that isn't even shown.
+function dummyStdin(req) {
+  if (req && req.__delayRequest) return Promise.resolve();
+  return Promise.resolve("0");
+}
 
-// Stdin for a program the user is actually running: pause on the terminal's own
-// input row (its Enter handler resolves `pendingInputResolve`) exactly like a real
-// terminal would block a program's stdin read.
+// Stdin/delay handling for a program the user is actually running: Get/Get_Line
+// pause on the terminal's own input row (its Enter handler resolves
+// `pendingInputResolve`) exactly like a real terminal would block a program's stdin
+// read; `delay`/`delay until` waits for real wall-clock time via setTimeout, without
+// freezing the page (the interpreter is merely suspended, not the browser).
 let pendingInputResolve = null;
-function interactiveStdin() {
+function interactiveStdin(req) {
+  if (req && req.__delayRequest) return new Promise((resolve) => setTimeout(resolve, req.ms));
   setTerminalTab("terminal");
   termInput.focus();
   return new Promise((resolve) => { pendingInputResolve = resolve; });
