@@ -42,6 +42,9 @@ class AdaRecord {
   set(name, val) { this.values.set(name.toLowerCase(), val); }
 }
 
+// Thrown by `exit` to leave the innermost enclosing loop.
+class ExitSignal {}
+
 class AdaEnum {
   constructor(typeName, name, ordinal) {
     this.typeName = typeName;
@@ -299,6 +302,15 @@ class Parser {
     if (this.atKeyword("array")) {
       this.next();
       this.expectOp("(");
+      if (this.peek().type === "ident" && this.peek(1).type === "ident" && this.peek(1).value.toLowerCase() === "range") {
+        // unconstrained: array (Positive range <>) of T — bounds come from the value assigned
+        while (!this.atOp(")")) this.next();
+        this.next();
+        this.expectKeyword("of");
+        const elemType = this.expectIdent();
+        this.expectOp(";");
+        return { kind: "type", name, def: { kind: "unconstrained", elemType } };
+      }
       const low = this.parseExpr();
       this.expectOp("..");
       const high = this.parseExpr();
@@ -429,6 +441,14 @@ class Parser {
       if (this.atKeyword("when")) { this.next(); cond = this.parseExpr(); }
       this.expectOp(";");
       return { kind: "exit", cond };
+    }
+    if (this.atKeyword("loop")) {
+      this.next();
+      const body = this.parseStatements(["end"]);
+      this.expectKeyword("end");
+      this.expectKeyword("loop");
+      this.expectOp(";");
+      return { kind: "loop", body };
     }
 
     // assignment, field/index paths, or procedure calls
@@ -568,9 +588,16 @@ class Parser {
     this.expectKeyword("in");
     let reverse = false;
     if (this.atKeyword("reverse")) { reverse = true; this.next(); }
-    const from = this.parseExpr();
-    this.expectOp("..");
-    const to = this.parseExpr();
+    let from = this.parseExpr();
+    let to;
+    if (from.kind === "attr" && from.attr.toLowerCase() === "range") {
+      // for I in Arr'Range loop  ==  for I in Arr'First .. Arr'Last
+      to = { kind: "attr", expr: from.expr, attr: "Last" };
+      from = { kind: "attr", expr: from.expr, attr: "First" };
+    } else {
+      this.expectOp("..");
+      to = this.parseExpr();
+    }
     this.expectKeyword("loop");
     const body = this.parseStatements(["end"]);
     this.expectKeyword("end");
@@ -842,6 +869,8 @@ class Interpreter {
       env.setTypeDef(d.name, { kind: "record", fields: d.def.fields });
     } else if (d.def.kind === "array") {
       env.setTypeDef(d.name, { kind: "array", low: d.def.low, high: d.def.high, elemType: d.def.elemType });
+    } else if (d.def.kind === "unconstrained") {
+      env.setTypeDef(d.name, { kind: "unconstrained", elemType: d.def.elemType });
     } else {
       env.setTypeDef(d.name, { kind: "alias", base: d.def.base });
     }
@@ -859,7 +888,23 @@ class Interpreter {
     const isAggregate = init && init.kind === undefined && (init.pairs || init.items || init.others !== undefined);
     if (typeDef.kind === "record" && isAggregate) return this.buildRecordFromAggregate(typeDef, init, env);
     if (typeDef.kind === "array" && isAggregate) return this.buildArrayFromAggregate(typeDef, init, env);
+    if (typeDef.kind === "unconstrained" && isAggregate) {
+      // bounds of an unconstrained array come from the aggregate: 1 .. count (Positive/Natural default)
+      if (!init.items) throw new AdaError(`unconstrained array needs a positional aggregate`);
+      return new AdaArray(1, init.items.length, init.items.map(e => this.evalExpr(e, env)));
+    }
     return this.evalExpr(init, env);
+  }
+
+  // Runs one loop iteration; returns false when an `exit` ended the loop.
+  runLoopBody(body, env) {
+    try {
+      this.execStatements(body, env);
+      return true;
+    } catch (err) {
+      if (err instanceof ExitSignal) return false;
+      throw err;
+    }
   }
 
   defaultRecord(typeDef, env) {
@@ -1059,29 +1104,37 @@ class Interpreter {
         const prevEntry = env.vars.get(s.varName.toLowerCase());
         env.setVarEntry(s.varName, { type: "Integer", value: from, constant: false });
         const entry = env.vars.get(s.varName.toLowerCase());
-        if (s.reverse) {
-          for (let i = to; i >= from; i--) { entry.value = i; this.execStatements(s.body, env); }
-        } else {
-          for (let i = from; i <= to; i++) { entry.value = i; this.execStatements(s.body, env); }
+        try {
+          if (s.reverse) {
+            for (let i = to; i >= from; i--) { entry.value = i; if (!this.runLoopBody(s.body, env)) break; }
+          } else {
+            for (let i = from; i <= to; i++) { entry.value = i; if (!this.runLoopBody(s.body, env)) break; }
+          }
+        } finally {
+          if (prevEntry) env.vars.set(s.varName.toLowerCase(), prevEntry); else env.vars.delete(s.varName.toLowerCase());
         }
-        if (prevEntry) env.vars.set(s.varName.toLowerCase(), prevEntry); else env.vars.delete(s.varName.toLowerCase());
         return;
       }
       case "while": {
         while (this.evalExpr(s.cond, env) === true) {
-          this.execStatements(s.body, env);
+          if (!this.runLoopBody(s.body, env)) break;
           this.bump();
         }
         return;
       }
+      case "loop": {
+        while (this.runLoopBody(s.body, env)) this.bump();
+        return;
+      }
+      case "exit":
+        if (s.cond == null || this.evalExpr(s.cond, env) === true) throw new ExitSignal();
+        return;
       case "return":
         throw new ReturnSignal(s.expr != null ? this.evalExpr(s.expr, env) : undefined);
       case "raise": {
         const detail = s.msg ? ` : ${s.msg}` : "";
         throw new AdaError(`raised ${s.excName.toUpperCase()}${detail}`, s.line, s.col);
       }
-      case "exit":
-        return; // best-effort: real Ada `exit` breaks the innermost loop; not needed for straight-line student programs
       default:
         throw new AdaError(`unsupported statement: ${s.kind}`);
     }
