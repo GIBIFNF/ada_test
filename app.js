@@ -1003,8 +1003,26 @@ class Parser {
     }
     return expr;
   }
+  // Ada 2012 conditional expression: if C then A [elsif C then B]* else D
+  parseIfExpr() {
+    this.next(); // if
+    const branches = [];
+    const cond = this.parseExpr();
+    this.expectKeyword("then");
+    branches.push({ cond, expr: this.parseExpr() });
+    while (this.atKeyword("elsif")) {
+      this.next();
+      const c = this.parseExpr();
+      this.expectKeyword("then");
+      branches.push({ cond: c, expr: this.parseExpr() });
+    }
+    this.expectKeyword("else");
+    return { kind: "ifexpr", branches, elseExpr: this.parseExpr() };
+  }
+
   parsePrimary() {
     const t = this.peek();
+    if (this.atKeyword("if")) return this.parseIfExpr();
     if (t.type === "number") { this.next(); return { kind: "lit", value: parseFloat(t.value), isFloat: /[.eE]/.test(t.value) }; }
     if (t.type === "string") { this.next(); return { kind: "lit", value: t.value, isString: true }; }
     if (t.type === "char") { this.next(); return { kind: "lit", value: t.value, isChar: true }; }
@@ -1739,6 +1757,12 @@ class Interpreter {
         if (e.attr === "Value") return typeof v === "string" ? parseFloat(v) : v;
         if (e.attr === "Pos") return v instanceof AdaEnum ? v.ordinal : v;
         return v;
+      }
+      case "ifexpr": {
+        for (const b of e.branches) {
+          if (this.evalExpr(b.cond, env) === true) return this.evalExpr(b.expr, env);
+        }
+        return this.evalExpr(e.elseExpr, env);
       }
       case "funcall": {
         const lname = e.name.toLowerCase();
