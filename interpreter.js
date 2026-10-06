@@ -302,32 +302,50 @@ class Parser {
     if (this.atKeyword("array")) {
       this.next();
       this.expectOp("(");
-      if (this.peek().type === "ident" && this.peek(1).type === "ident" && this.peek(1).value.toLowerCase() === "range") {
-        // unconstrained: array (Positive range <>) of T — bounds come from the value assigned
-        while (!this.atOp(")")) this.next();
-        this.next();
-        this.expectKeyword("of");
-        const elemType = this.expectIdent();
-        this.expectOp(";");
-        return { kind: "type", name, def: { kind: "unconstrained", elemType } };
-      }
-      const low = this.parseExpr();
-      this.expectOp("..");
-      const high = this.parseExpr();
+      const index = this.parseIndexSpec();
       this.expectOp(")");
       this.expectKeyword("of");
       const elemType = this.expectIdent();
       this.expectOp(";");
-      return { kind: "type", name, def: { kind: "array", low, high, elemType } };
+      return { kind: "type", name, def: { kind: "array", index, elemType } };
     }
-    // subtype / derived-type fallback: "is [new] Base [range ...] [digits ...];" — we keep
-    // just the base type name and treat it as a plain alias.
+    // subtype / derived type: "is [new] Base [range A .. B];"
     if (this.atKeyword("new")) this.next();
     let base = "Integer";
-    if (this.peek().type === "ident") base = this.peek().value;
+    if (this.peek().type === "ident") base = this.next().value;
+    let range = null;
+    if (this.atKeyword("range")) {
+      this.next();
+      const low = this.parseExpr();
+      this.expectOp("..");
+      range = { low, high: this.parseExpr() };
+    }
     while (!this.atOp(";")) this.next();
     this.next();
-    return { kind: "type", name, def: { kind: "alias", base } };
+    return { kind: "type", name, def: { kind: "alias", base, range } };
+  }
+
+  // Array index part, after "(": "A .. B", "Subtype range A .. B", "Subtype range <>",
+  // "Subtype" (bounds come from the named subtype), or "A .. B" with a type name.
+  parseIndexSpec() {
+    if (this.peek().type === "ident" && this.peek(1).type === "ident" && this.peek(1).value.toLowerCase() === "range") {
+      const typeMark = this.expectIdent();
+      this.expectKeyword("range");
+      if (this.atOp("<")) {
+        this.next();
+        this.expectOp(">");
+        return { unconstrained: true, typeMark };
+      }
+      const low = this.parseExpr();
+      this.expectOp("..");
+      return { low, high: this.parseExpr() };
+    }
+    if (this.peek().type === "ident" && this.peek(1).type === "op" && this.peek(1).value === ")") {
+      return { typeMark: this.expectIdent() };
+    }
+    const low = this.parseExpr();
+    this.expectOp("..");
+    return { low, high: this.parseExpr() };
   }
 
   parseDeclarations() {
@@ -350,13 +368,11 @@ class Parser {
       if (this.atKeyword("array")) {
         this.next();
         this.expectOp("(");
-        const low = this.parseExpr();
-        this.expectOp("..");
-        const high = this.parseExpr();
+        const index = this.parseIndexSpec();
         this.expectOp(")");
         this.expectKeyword("of");
         const elemType = this.expectIdent();
-        arrayType = { low, high, elemType };
+        arrayType = { index, elemType };
       } else {
         typeName = this.expectIdent();
       }
@@ -845,7 +861,7 @@ class Interpreter {
         continue;
       }
       if (d.arrayType) {
-        const value = d.init ? this.buildArrayFromAggregate(d.arrayType, d.init, env) : this.defaultArray(d.arrayType, env);
+        const value = d.init ? this.evalInitForType({ kind: "array", ...d.arrayType }, d.init, env) : this.defaultArray(d.arrayType, env);
         env.setVarEntry(d.name, { type: "array", value, constant: d.constant });
         continue;
       }
@@ -868,11 +884,9 @@ class Interpreter {
     } else if (d.def.kind === "record") {
       env.setTypeDef(d.name, { kind: "record", fields: d.def.fields });
     } else if (d.def.kind === "array") {
-      env.setTypeDef(d.name, { kind: "array", low: d.def.low, high: d.def.high, elemType: d.def.elemType });
-    } else if (d.def.kind === "unconstrained") {
-      env.setTypeDef(d.name, { kind: "unconstrained", elemType: d.def.elemType });
+      env.setTypeDef(d.name, { kind: "array", index: d.def.index, elemType: d.def.elemType });
     } else {
-      env.setTypeDef(d.name, { kind: "alias", base: d.def.base });
+      env.setTypeDef(d.name, { kind: "alias", base: d.def.base, range: d.def.range });
     }
   }
 
@@ -880,7 +894,10 @@ class Interpreter {
     if (typeDef.kind === "enum") return typeDef.literalValues[0];
     if (typeDef.kind === "record") return this.defaultRecord(typeDef, env);
     if (typeDef.kind === "array") return this.defaultArray(typeDef, env);
-    if (typeDef.kind === "alias") return this.defaultValue(typeDef.base);
+    if (typeDef.kind === "alias") {
+      const baseDef = env.getType(typeDef.base);
+      return baseDef ? this.defaultForType(baseDef, env) : this.defaultValue(typeDef.base);
+    }
     return null;
   }
 
@@ -888,12 +905,22 @@ class Interpreter {
     const isAggregate = init && init.kind === undefined && (init.pairs || init.items || init.others !== undefined);
     if (typeDef.kind === "record" && isAggregate) return this.buildRecordFromAggregate(typeDef, init, env);
     if (typeDef.kind === "array" && isAggregate) return this.buildArrayFromAggregate(typeDef, init, env);
-    if (typeDef.kind === "unconstrained" && isAggregate) {
-      // bounds of an unconstrained array come from the aggregate: 1 .. count (Positive/Natural default)
-      if (!init.items) throw new AdaError(`unconstrained array needs a positional aggregate`);
-      return new AdaArray(1, init.items.length, init.items.map(e => this.evalExpr(e, env)));
-    }
     return this.evalExpr(init, env);
+  }
+
+  // Resolves the bounds of an array index. Unconstrained indices take their
+  // bounds from the aggregate length (Positive/Natural default to 1 .. count).
+  resolveIndex(index, env, aggCount) {
+    if (index.unconstrained) {
+      if (aggCount === undefined) throw new AdaError(`unconstrained array needs an initial value to fix its bounds`);
+      return [1, aggCount];
+    }
+    if (index.low) return [this.evalExpr(index.low, env), this.evalExpr(index.high, env)];
+    const typeDef = env.getType(index.typeMark);
+    if (typeDef && typeDef.kind === "alias" && typeDef.range) {
+      return [this.evalExpr(typeDef.range.low, env), this.evalExpr(typeDef.range.high, env)];
+    }
+    throw new AdaError(`array index type "${index.typeMark}" has no known range`);
   }
 
   // Runs one loop iteration; returns false when an `exit` ended the loop.
@@ -940,8 +967,7 @@ class Interpreter {
   }
 
   defaultArray(arrayType, env) {
-    const low = this.evalExpr(arrayType.low, env);
-    const high = this.evalExpr(arrayType.high, env);
+    const [low, high] = this.resolveIndex(arrayType.index, env);
     const n = Math.max(0, high - low + 1);
     const elemTypeDef = env.getType(arrayType.elemType);
     const fill = elemTypeDef ? this.defaultForType(elemTypeDef, env) : this.defaultValue(arrayType.elemType);
@@ -949,8 +975,7 @@ class Interpreter {
   }
 
   buildArrayFromAggregate(arrayType, aggregate, env) {
-    const low = this.evalExpr(arrayType.low, env);
-    const high = this.evalExpr(arrayType.high, env);
+    const [low, high] = this.resolveIndex(arrayType.index, env, aggregate.items ? aggregate.items.length : undefined);
     const n = Math.max(0, high - low + 1);
     let items;
     if (aggregate.others !== undefined) {
@@ -1231,6 +1256,11 @@ class Interpreter {
     if (typeDef && typeDef.kind === "enum") {
       if (attr === "First") return typeDef.literalValues[0];
       if (attr === "Last") return typeDef.literalValues[typeDef.literalValues.length - 1];
+    }
+    if (typeDef && typeDef.kind === "alias" && typeDef.range) {
+      const [lo, hi] = [this.evalExpr(typeDef.range.low, env), this.evalExpr(typeDef.range.high, env)];
+      if (attr === "First") return lo;
+      if (attr === "Last") return hi;
     }
     return undefined;
   }
