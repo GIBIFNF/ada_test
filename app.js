@@ -477,23 +477,50 @@ class Parser {
     if (this.atKeyword("array")) {
       this.next();
       this.expectOp("(");
-      const low = this.parseExpr();
-      this.expectOp("..");
-      const high = this.parseExpr();
+      const index = this.parseIndexSpec();
       this.expectOp(")");
       this.expectKeyword("of");
       const elemType = this.expectIdent();
       this.expectOp(";");
-      return { kind: "type", name, def: { kind: "array", low, high, elemType } };
+      return { kind: "type", name, def: { kind: "array", index, elemType } };
     }
-    // subtype / derived-type fallback: "is [new] Base [range ...] [digits ...];" — we keep
-    // just the base type name and treat it as a plain alias.
+    // subtype / derived type: "is [new] Base [range A .. B];"
     if (this.atKeyword("new")) this.next();
     let base = "Integer";
-    if (this.peek().type === "ident") base = this.peek().value;
+    if (this.peek().type === "ident") base = this.next().value;
+    let range = null;
+    if (this.atKeyword("range")) {
+      this.next();
+      const low = this.parseExpr();
+      this.expectOp("..");
+      range = { low, high: this.parseExpr() };
+    }
     while (!this.atOp(";")) this.next();
     this.next();
-    return { kind: "type", name, def: { kind: "alias", base } };
+    return { kind: "type", name, def: { kind: "alias", base, range } };
+  }
+
+  // Array index part, after "(": "A .. B", "Subtype range A .. B", "Subtype range <>",
+  // "Subtype" (bounds come from the named subtype), or "A .. B" with a type name.
+  parseIndexSpec() {
+    if (this.peek().type === "ident" && this.peek(1).type === "ident" && this.peek(1).value.toLowerCase() === "range") {
+      const typeMark = this.expectIdent();
+      this.expectKeyword("range");
+      if (this.atOp("<")) {
+        this.next();
+        this.expectOp(">");
+        return { unconstrained: true, typeMark };
+      }
+      const low = this.parseExpr();
+      this.expectOp("..");
+      return { low, high: this.parseExpr() };
+    }
+    if (this.peek().type === "ident" && this.peek(1).type === "op" && this.peek(1).value === ")") {
+      return { typeMark: this.expectIdent() };
+    }
+    const low = this.parseExpr();
+    this.expectOp("..");
+    return { low, high: this.parseExpr() };
   }
 
   parseDeclarations() {
@@ -550,13 +577,11 @@ class Parser {
       if (this.atKeyword("array")) {
         this.next();
         this.expectOp("(");
-        const low = this.parseExpr();
-        this.expectOp("..");
-        const high = this.parseExpr();
+        const index = this.parseIndexSpec();
         this.expectOp(")");
         this.expectKeyword("of");
         const elemType = this.expectIdent();
-        arrayType = { low, high, elemType };
+        arrayType = { index, elemType };
       } else {
         typeName = this.expectIdent();
         // Discard package qualifiers on the type name ("Int_Vectors.Vector" -> "Vector") —
@@ -831,9 +856,16 @@ class Parser {
     this.expectKeyword("in");
     let reverse = false;
     if (this.atKeyword("reverse")) { reverse = true; this.next(); }
-    const from = this.parseExpr();
-    this.expectOp("..");
-    const to = this.parseExpr();
+    let from = this.parseExpr();
+    let to;
+    if (from.kind === "attr" && from.attr.toLowerCase() === "range") {
+      // for I in Arr'Range loop  ==  for I in Arr'First .. Arr'Last
+      to = { kind: "attr", expr: from.expr, attr: "Last" };
+      from = { kind: "attr", expr: from.expr, attr: "First" };
+    } else {
+      this.expectOp("..");
+      to = this.parseExpr();
+    }
     this.expectKeyword("loop");
     const body = this.parseStatements(["end"]);
     this.expectKeyword("end");
@@ -1147,9 +1179,9 @@ class Interpreter {
     } else if (d.def.kind === "record") {
       env.setTypeDef(d.name, { kind: "record", fields: d.def.fields });
     } else if (d.def.kind === "array") {
-      env.setTypeDef(d.name, { kind: "array", low: d.def.low, high: d.def.high, elemType: d.def.elemType });
+      env.setTypeDef(d.name, { kind: "array", index: d.def.index, elemType: d.def.elemType });
     } else {
-      env.setTypeDef(d.name, { kind: "alias", base: d.def.base });
+      env.setTypeDef(d.name, { kind: "alias", base: d.def.base, range: d.def.range });
     }
   }
 
@@ -1201,9 +1233,22 @@ class Interpreter {
     return null;
   }
 
+  // Bounds of an array index. Unconstrained indices take 1 .. count from the aggregate.
+  resolveIndex(index, env, aggCount) {
+    if (index.unconstrained) {
+      if (aggCount === undefined) throw new AdaError(`unconstrained array needs an initial value to fix its bounds`);
+      return [1, aggCount];
+    }
+    if (index.low) return [this.evalExpr(index.low, env), this.evalExpr(index.high, env)];
+    const typeDef = env.getType(index.typeMark);
+    if (typeDef && typeDef.kind === "alias" && typeDef.range) {
+      return [this.evalExpr(typeDef.range.low, env), this.evalExpr(typeDef.range.high, env)];
+    }
+    throw new AdaError(`array index type "${index.typeMark}" has no known range`);
+  }
+
   defaultArray(arrayType, env) {
-    const low = this.evalExpr(arrayType.low, env);
-    const high = this.evalExpr(arrayType.high, env);
+    const [low, high] = this.resolveIndex(arrayType.index, env);
     const n = Math.max(0, high - low + 1);
     const elemTypeDef = env.getType(arrayType.elemType);
     const fill = elemTypeDef ? this.defaultForType(elemTypeDef, env) : this.defaultValue(arrayType.elemType);
@@ -1211,8 +1256,7 @@ class Interpreter {
   }
 
   buildArrayFromAggregate(arrayType, aggregate, env) {
-    const low = this.evalExpr(arrayType.low, env);
-    const high = this.evalExpr(arrayType.high, env);
+    const [low, high] = this.resolveIndex(arrayType.index, env, aggregate.items ? aggregate.items.length : undefined);
     const n = Math.max(0, high - low + 1);
     let items;
     if (aggregate.others !== undefined) {
@@ -1614,6 +1658,10 @@ class Interpreter {
     if (typeDef && typeDef.kind === "enum") {
       if (attr === "First") return typeDef.literalValues[0];
       if (attr === "Last") return typeDef.literalValues[typeDef.literalValues.length - 1];
+    }
+    if (typeDef && typeDef.kind === "alias" && typeDef.range) {
+      if (attr === "First") return this.evalExpr(typeDef.range.low, env);
+      if (attr === "Last") return this.evalExpr(typeDef.range.high, env);
     }
     return undefined;
   }
