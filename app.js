@@ -3961,13 +3961,15 @@ async function handleCommand(raw) {
           break;
         }
         try {
-          const result = sqlExecOne(db, rest[1], []);
-          if (result.type === "select") {
-            printSqlTable(result.columns, result.rows);
-          } else {
-            persistDb(dbFile.name, db);
-            logTerm(`OK — ${result.type}${result.count != null ? `, ${result.count} wiersz(y)` : ""} (${rest[0]})`, "ok");
-          }
+          // Run every ";"-separated statement given, not just the first one — pasting a
+          // whole "CREATE TABLE ...; INSERT ...;" schema as one line is the common case,
+          // and silently dropping everything after the first ";" left tables empty.
+          const results = sqlExecScript(db, rest[1]).filter(r => r.type !== "comment");
+          if (results.some(r => r.type !== "select")) persistDb(dbFile.name, db);
+          results.forEach(r => {
+            if (r.type === "select") printSqlTable(r.columns, r.rows);
+            else logTerm(`OK — ${r.type}${r.count != null ? `, ${r.count} wiersz(y)` : ""} (${rest[0]})`, "ok");
+          });
         } catch (err) {
           logTerm(`Error: ${err.message}`, "err");
         }
