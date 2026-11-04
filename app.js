@@ -399,7 +399,9 @@ class Parser {
         let mode = "in";
         if (this.atKeyword("in")) { this.next(); if (this.atKeyword("out")) { this.next(); mode = "inout"; } }
         else if (this.atKeyword("out")) { this.next(); mode = "out"; }
-        const type = this.expectIdent();
+        else if (this.atKeyword("access")) { this.next(); mode = "access"; }
+        let type = this.expectIdent();
+        while (this.atOp(".")) { this.next(); type = this.expectIdent(); }
         for (const nm of names) params.push({ name: nm, type, mode });
       } while (this.atOp(";") ? (this.next(), true) : false);
     }
@@ -407,12 +409,42 @@ class Parser {
     return params;
   }
 
+  // "with Aspect1, Aspect2 => Value, ...;" — an Ada 2012 aspect specification, used
+  // here only to read External_Name off a foreign-import subprogram declaration.
+  parseAspects() {
+    this.next(); // 'with'
+    const aspects = {};
+    do {
+      const key = this.expectIdent().toLowerCase();
+      let value = true;
+      if (this.atOp("=>")) {
+        this.next();
+        if (this.peek().type === "string") value = this.next().value;
+        else { value = this.expectIdent(); while (this.atOp(".")) { this.next(); value = this.expectIdent(); } }
+      }
+      aspects[key] = value;
+    } while (this.atOp(",") ? (this.next(), true) : false);
+    this.expectOp(";");
+    return aspects;
+  }
+
   parseSubprogram() {
     const kind = this.next().value.toLowerCase(); // "procedure" | "function"
     const name = this.expectIdent();
     const params = this.atOp("(") ? this.parseParams() : [];
     let returnType = null;
-    if (kind === "function") { this.expectKeyword("return"); returnType = this.expectIdent(); }
+    if (kind === "function") {
+      this.expectKeyword("return");
+      returnType = this.expectIdent();
+      while (this.atOp(".")) { this.next(); returnType = this.expectIdent(); }
+    }
+    if (this.atKeyword("with")) {
+      // "... with Import, Convention => C, External_Name => "sqlite3_open";" — a foreign
+      // (C) subprogram import with no Ada body. We simulate a handful of well-known
+      // External_Name values (see FFI_BUILTINS) instead of actually linking against C.
+      const aspects = this.parseAspects();
+      return { kind: "externalimport", name, params, returnType, aspects };
+    }
     this.expectKeyword("is");
     const decls = this.parseDeclarations();
     this.expectKeyword("begin");
@@ -465,7 +497,8 @@ class Parser {
         const names = [this.expectIdent()];
         while (this.atOp(",")) { this.next(); names.push(this.expectIdent()); }
         this.expectOp(":");
-        const ftype = this.expectIdent();
+        let ftype = this.expectIdent();
+        while (this.atOp(".")) { this.next(); ftype = this.expectIdent(); }
         this.expectOp(";");
         for (const nm of names) fields.push({ name: nm, type: ftype });
       }
@@ -480,7 +513,8 @@ class Parser {
       const index = this.parseIndexSpec();
       this.expectOp(")");
       this.expectKeyword("of");
-      const elemType = this.expectIdent();
+      let elemType = this.expectIdent();
+      while (this.atOp(".")) { this.next(); elemType = this.expectIdent(); }
       this.expectOp(";");
       return { kind: "type", name, def: { kind: "array", index, elemType } };
     }
@@ -573,6 +607,7 @@ class Parser {
       this.expectOp(":");
       let constant = false;
       if (this.atKeyword("constant")) { constant = true; this.next(); }
+      if (this.atKeyword("aliased")) this.next();
       let arrayType = null, typeName = null;
       if (this.atKeyword("array")) {
         this.next();
@@ -580,7 +615,8 @@ class Parser {
         const index = this.parseIndexSpec();
         this.expectOp(")");
         this.expectKeyword("of");
-        const elemType = this.expectIdent();
+        let elemType = this.expectIdent();
+        while (this.atOp(".")) { this.next(); elemType = this.expectIdent(); }
         arrayType = { index, elemType };
       } else {
         typeName = this.expectIdent();
@@ -1129,6 +1165,333 @@ const STRING_FUNCTIONS = {
   index: (s, pat) => { const i = String(s).indexOf(String(pat)); return i === -1 ? 0 : i + 1; },
 };
 
+// ============================================================================
+// A tiny SQLite-like engine, used two ways:
+//   1. By the "sqlite3_*" External_Name imports below, simulating the real C
+//      library so programs written against it (Interfaces.C.Strings bindings
+//      and all) run unmodified in the browser.
+//   2. By the terminal's `sqlite3` / `sql-run` commands for ad-hoc queries.
+// A ".db" file's `content` is plain JSON: {"tables":{"name":{"columns":[...],
+// "rows":[{...}]}}} — real sqlite files are binary anyway, so this is a
+// reasonable in-browser stand-in, and it rides on the existing file/localStorage
+// machinery for free (rename, download, persistence all just work).
+// ============================================================================
+
+function sqlTokenize(sql) {
+  const toks = [];
+  const n = sql.length;
+  let i = 0;
+  while (i < n) {
+    const c = sql[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === "-" && sql[i + 1] === "-") { while (i < n && sql[i] !== "\n") i++; continue; }
+    if (c === "'") {
+      let j = i + 1, str = "";
+      while (j < n && sql[j] !== "'") { str += sql[j]; j++; }
+      j++;
+      toks.push({ t: "str", v: str });
+      i = j;
+      continue;
+    }
+    if (/[0-9]/.test(c)) {
+      let j = i;
+      while (j < n && /[0-9.]/.test(sql[j])) j++;
+      toks.push({ t: "num", v: parseFloat(sql.slice(i, j)) });
+      i = j;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i;
+      while (j < n && /[A-Za-z0-9_]/.test(sql[j])) j++;
+      toks.push({ t: "word", v: sql.slice(i, j) });
+      i = j;
+      continue;
+    }
+    const two = sql.slice(i, i + 2);
+    if (["<=", ">=", "<>", "!="].includes(two)) { toks.push({ t: "op", v: two }); i += 2; continue; }
+    if ("(),;=<>*.?".includes(c)) { toks.push({ t: "op", v: c }); i++; continue; }
+    i++;
+  }
+  return toks;
+}
+
+// Executes exactly one SQL statement (no trailing ";") against `db.tables`.
+// `params` feeds "?" placeholders, in order — used by sqlite3_bind_*.
+function sqlExecOne(db, sqlText, params) {
+  params = params || [];
+  let pi = 0;
+  const toks = sqlTokenize(sqlText);
+  if (!toks.length) return { type: "comment", changed: false }; // whole chunk was a "-- comment"
+  let p = 0;
+  const peek = (o = 0) => toks[p + o];
+  const atOp = (v, o = 0) => { const t = peek(o); return !!t && t.t === "op" && t.v === v; };
+  const word = (o = 0) => { const t = peek(o); return t && t.t === "word" ? t.v.toUpperCase() : null; };
+  const next = () => toks[p++];
+  const expectOp = (v) => { if (!atOp(v)) throw new Error(`SQL: expected "${v}"`); return next(); };
+  const readIdent = () => { const t = next(); if (!t || t.t !== "word") throw new Error("SQL: expected a name"); return t.v; };
+  const readValue = () => {
+    const t = next();
+    if (!t) throw new Error("SQL: unexpected end of statement");
+    if (t.t === "op" && t.v === "?") return params[pi++];
+    if (t.t === "str") return t.v;
+    if (t.t === "num") return t.v;
+    if (t.t === "word") {
+      const w = t.v.toUpperCase();
+      if (w === "NULL") return null;
+      if (w === "TRUE") return true;
+      if (w === "FALSE") return false;
+      return t.v;
+    }
+    throw new Error("SQL: expected a value");
+  };
+  const readWhere = () => {
+    if (word() !== "WHERE") return () => true;
+    next();
+    const conds = [];
+    do {
+      const col = readIdent().toLowerCase();
+      const opTok = next();
+      const op = opTok && opTok.t === "op" ? opTok.v : "=";
+      const val = readValue();
+      conds.push({ col, op, val });
+    } while (word() === "AND" ? (next(), true) : false);
+    return (row) => conds.every(c => {
+      const rv = row[c.col];
+      switch (c.op) {
+        case "!=": case "<>": return rv != c.val;
+        case "<": return rv < c.val;
+        case "<=": return rv <= c.val;
+        case ">": return rv > c.val;
+        case ">=": return rv >= c.val;
+        default: return rv == c.val;
+      }
+    });
+  };
+
+  if (word() === "CREATE") {
+    next();
+    if (word() === "TABLE") next();
+    if (word() === "IF") { next(); next(); next(); } // IF NOT EXISTS
+    const name = readIdent();
+    expectOp("(");
+    const columns = [];
+    while (!atOp(")")) {
+      columns.push(readIdent());
+      let depth = 0;
+      while (peek() && !((atOp(",") && depth === 0) || (atOp(")") && depth === 0))) {
+        const t = next();
+        if (t.t === "op" && t.v === "(") depth++;
+        if (t.t === "op" && t.v === ")") depth--;
+      }
+      if (atOp(",")) next();
+    }
+    expectOp(")");
+    const key = name.toLowerCase();
+    if (!db.tables[key]) db.tables[key] = { name, columns, rows: [] };
+    return { type: "create", table: name, changed: true };
+  }
+
+  if (word() === "INSERT") {
+    next();
+    if (word() === "INTO") next();
+    const name = readIdent();
+    const table = db.tables[name.toLowerCase()];
+    if (!table) throw new Error(`no such table: ${name}`);
+    let cols = table.columns;
+    if (atOp("(")) {
+      next();
+      cols = [];
+      while (!atOp(")")) { cols.push(readIdent()); if (atOp(",")) next(); }
+      next();
+    }
+    if (word() !== "VALUES") throw new Error("SQL: expected VALUES");
+    next();
+    let count = 0;
+    do {
+      expectOp("(");
+      const vals = [];
+      while (!atOp(")")) { vals.push(readValue()); if (atOp(",")) next(); }
+      next();
+      const row = {};
+      cols.forEach((c, i) => { row[c.toLowerCase()] = vals[i]; });
+      table.rows.push(row);
+      count++;
+    } while (atOp(",") ? (next(), true) : false);
+    return { type: "insert", table: name, changed: true, count };
+  }
+
+  if (word() === "SELECT") {
+    next();
+    let cols = null; // null == "*"
+    if (atOp("*")) next();
+    else {
+      cols = [];
+      do {
+        if (peek() && peek().t === "num") { next(); continue; } // "SELECT 1 FROM ..." existence checks
+        cols.push(readIdent());
+      } while (atOp(",") ? (next(), true) : false);
+    }
+    if (word() !== "FROM") throw new Error("SQL: expected FROM");
+    next();
+    const name = readIdent();
+    const table = db.tables[name.toLowerCase()];
+    if (!table) throw new Error(`no such table: ${name}`);
+    const whereFn = readWhere();
+    let limit = Infinity;
+    if (word() === "LIMIT") { next(); limit = readValue(); }
+    let rows = table.rows.filter(whereFn).slice(0, limit);
+    const outCols = cols && cols.length ? cols : table.columns;
+    rows = rows.map(r => { const o = {}; outCols.forEach(c => { o[c.toLowerCase()] = r[c.toLowerCase()]; }); return o; });
+    return { type: "select", table: name, rows, columns: outCols };
+  }
+
+  if (word() === "UPDATE") {
+    next();
+    const name = readIdent();
+    const table = db.tables[name.toLowerCase()];
+    if (!table) throw new Error(`no such table: ${name}`);
+    if (word() !== "SET") throw new Error("SQL: expected SET");
+    next();
+    const sets = [];
+    do {
+      const col = readIdent().toLowerCase();
+      expectOp("=");
+      sets.push([col, readValue()]);
+    } while (atOp(",") ? (next(), true) : false);
+    const whereFn = readWhere();
+    let count = 0;
+    table.rows.forEach(r => { if (whereFn(r)) { sets.forEach(([c, v]) => { r[c] = v; }); count++; } });
+    return { type: "update", table: name, changed: count > 0, count };
+  }
+
+  if (word() === "DELETE") {
+    next();
+    if (word() === "FROM") next();
+    const name = readIdent();
+    const table = db.tables[name.toLowerCase()];
+    if (!table) throw new Error(`no such table: ${name}`);
+    const whereFn = readWhere();
+    const before = table.rows.length;
+    table.rows = table.rows.filter(r => !whereFn(r));
+    return { type: "delete", table: name, changed: true, count: before - table.rows.length };
+  }
+
+  throw new Error(`unsupported SQL statement`);
+}
+
+// Runs every ";"-separated statement in a script against `db`, in order.
+function sqlExecScript(db, script) {
+  const results = [];
+  for (const stmt of script.split(";").map(s => s.trim()).filter(Boolean)) {
+    results.push(sqlExecOne(db, stmt, []));
+  }
+  return results;
+}
+
+// ---- ".db" files live in the same `files[]` array as everything else ----
+function ensureDbFile(name, initialContent) {
+  let f = files.find(x => x.name === name);
+  if (!f) {
+    f = { id: nextId++, name, content: initialContent, dirty: false };
+    files.push(f);
+    saveState();
+    if (typeof renderFileList === "function") renderFileList();
+  }
+  return f;
+}
+function loadDbFromFile(file) {
+  try {
+    const d = JSON.parse(file.content || "{}");
+    if (!d.tables) d.tables = {};
+    return d;
+  } catch { return { tables: {} }; }
+}
+function persistDb(fileName, db) {
+  const f = files.find(x => x.name === fileName);
+  if (!f) return;
+  f.content = JSON.stringify(db, null, 2);
+  f.dirty = true;
+  saveState();
+  if (typeof renderFileList === "function") renderFileList();
+}
+
+// SQLite C API functions this simulator understands, keyed by External_Name.
+// Each receives (interpreter, callerEnv, positional argument AST nodes) and
+// returns the plain int result code the real function would return.
+const SQLITE_OK = 0, SQLITE_ERROR = 1, SQLITE_ROW = 100, SQLITE_DONE = 101;
+
+function ffiWriteAccess(env, argExpr, value) {
+  // Writes through an "X'Access" argument — our stand-in for a C out-pointer.
+  if (argExpr && argExpr.kind === "attr" && argExpr.attr.toLowerCase() === "access" && argExpr.expr.kind === "var") {
+    const entry = env.getVarEntry(argExpr.expr.name);
+    if (entry) entry.value = value;
+    return true;
+  }
+  return false;
+}
+
+const FFI_BUILTINS = {
+  sqlite3_open(interp, env, a) {
+    const filename = String(interp.evalExpr(a[0], env) ?? "");
+    const file = ensureDbFile(filename, JSON.stringify({ tables: {} }, null, 2));
+    const db = loadDbFromFile(file);
+    ffiWriteAccess(env, a[1], { __sqliteDb: true, fileName: filename, db });
+    return SQLITE_OK;
+  },
+  sqlite3_prepare_v2(interp, env, a) {
+    const handle = interp.evalExpr(a[0], env);
+    const sqlText = String(interp.evalExpr(a[1], env) ?? "");
+    if (!handle || !handle.__sqliteDb) return SQLITE_ERROR;
+    const stmt = { __sqliteStmt: true, handle, sqlText, params: [], executed: false, rows: [], cursor: 0, currentRow: null };
+    if (!ffiWriteAccess(env, a[3], stmt)) return SQLITE_ERROR;
+    return SQLITE_OK;
+  },
+  sqlite3_bind_text(interp, env, a) {
+    const stmt = interp.evalExpr(a[0], env);
+    const idx = interp.evalExpr(a[1], env);
+    if (!stmt || !stmt.__sqliteStmt) return SQLITE_ERROR;
+    stmt.params[idx - 1] = String(interp.evalExpr(a[2], env) ?? "");
+    return SQLITE_OK;
+  },
+  sqlite3_bind_int(interp, env, a) {
+    const stmt = interp.evalExpr(a[0], env);
+    const idx = interp.evalExpr(a[1], env);
+    if (!stmt || !stmt.__sqliteStmt) return SQLITE_ERROR;
+    stmt.params[idx - 1] = interp.evalExpr(a[2], env);
+    return SQLITE_OK;
+  },
+  sqlite3_step(interp, env, a) {
+    const stmt = interp.evalExpr(a[0], env);
+    if (!stmt || !stmt.__sqliteStmt) return SQLITE_ERROR;
+    if (!stmt.executed) {
+      stmt.executed = true;
+      let result;
+      try { result = sqlExecOne(stmt.handle.db, stmt.sqlText, stmt.params); }
+      catch { return SQLITE_ERROR; }
+      if (result.type === "select") { stmt.rows = result.rows; stmt.cursor = 0; }
+      else persistDb(stmt.handle.fileName, stmt.handle.db);
+    }
+    if (stmt.cursor < stmt.rows.length) { stmt.currentRow = stmt.rows[stmt.cursor]; stmt.cursor++; return SQLITE_ROW; }
+    return SQLITE_DONE;
+  },
+  sqlite3_column_text(interp, env, a) {
+    const stmt = interp.evalExpr(a[0], env);
+    const idx = interp.evalExpr(a[1], env);
+    if (!stmt || !stmt.currentRow) return "";
+    const key = Object.keys(stmt.currentRow)[idx];
+    return String(stmt.currentRow[key] ?? "");
+  },
+  sqlite3_column_int(interp, env, a) {
+    const stmt = interp.evalExpr(a[0], env);
+    const idx = interp.evalExpr(a[1], env);
+    if (!stmt || !stmt.currentRow) return 0;
+    const key = Object.keys(stmt.currentRow)[idx];
+    return Number(stmt.currentRow[key]) || 0;
+  },
+  sqlite3_finalize() { return SQLITE_OK; },
+  sqlite3_close() { return SQLITE_OK; },
+};
+
 class Interpreter {
   constructor(onOutput) {
     this.onOutput = onOutput || (() => {});
@@ -1167,6 +1530,11 @@ class Interpreter {
     for (const d of decls) {
       if (d.kind === "procedure" || d.kind === "function") {
         env.defineSub(d.name, { ...d, closureEnv: env });
+        continue;
+      }
+      if (d.kind === "externalimport") {
+        const externalName = typeof d.aspects.external_name === "string" ? d.aspects.external_name : d.name;
+        env.defineSub(d.name, { kind: "external", name: d.name, params: d.params, returnType: d.returnType, externalName, closureEnv: env });
         continue;
       }
       if (d.kind === "type") {
@@ -1357,6 +1725,7 @@ class Interpreter {
         const entry = env.getVarEntry(s.name);
         if (!entry) throw new AdaError(`"${s.name}" is undefined`, s.line, s.col);
         if (entry.constant) throw new AdaError(`left hand side of assignment must not be constant`, s.line, s.col);
+        if (s.expr.kind !== "aggregate") yield* this.prefetchGetLine(s.expr, env);
         entry.value = s.expr.kind === "aggregate"
           ? this.resolveAggregate(s.expr.agg, entry.value, env)
           : this.evalExpr(s.expr, env);
@@ -1600,9 +1969,76 @@ class Interpreter {
       const recv = this.evalExpr(args[0].expr, env);
       if (recv instanceof AdaVector) { recv.items.pop(); return; }
     }
+    if (lname === "free") return; // Interfaces.C.Strings.Free — no-op, chars_ptr is just a String here
     const sub = env.getSub(name);
-    if (sub) { yield* this.callSub(sub, args, env); return; }
+    if (sub) {
+      if (sub.kind === "external") { this.callExternal(sub, args, env, line, col); return; }
+      yield* this.callSub(sub, args, env);
+      return;
+    }
     throw new AdaError(`"${name}" is undefined`, line, col);
+  }
+
+  // evalExpr is synchronous and can't pause for stdin, but Ada's function-style
+  // "Get_Line return String" is legal anywhere in an expression (e.g.
+  // "X := To_Unbounded_String (Get_Line);"). This generator walks the expression
+  // tree first, reading input for every bare Get_Line/Get call it finds and
+  // rewriting that node in place to a literal, so the later plain evalExpr()
+  // just sees ordinary values.
+  *prefetchGetLine(expr, env) {
+    if (!expr || typeof expr !== "object") return;
+    const isBareGetLine =
+      (expr.kind === "funcall" && expr.args.length === 0 && ["get_line", "get"].includes(expr.name.toLowerCase())) ||
+      // The parameterless function form is just the bare name in Ada: "Get_Line", no "()".
+      (expr.kind === "var" && ["get_line", "get"].includes(expr.name.toLowerCase()) && !env.findVarEnv(expr.name));
+    if (isBareGetLine) {
+      this.flushLine();
+      const raw = (yield { __inputRequest: true }).trim();
+      expr.kind = "lit";
+      expr.value = raw;
+      expr.args = undefined;
+      expr.name = undefined;
+      return;
+    }
+    switch (expr.kind) {
+      case "unary": case "not": case "field":
+        yield* this.prefetchGetLine(expr.expr, env);
+        return;
+      case "attr":
+        yield* this.prefetchGetLine(expr.expr, env);
+        return;
+      case "attrcall":
+        yield* this.prefetchGetLine(expr.expr, env);
+        for (const a of expr.args) yield* this.prefetchGetLine(a, env);
+        return;
+      case "funcall":
+        for (const a of expr.args) yield* this.prefetchGetLine(a.expr, env);
+        return;
+      case "bin":
+        yield* this.prefetchGetLine(expr.left, env);
+        yield* this.prefetchGetLine(expr.right, env);
+        return;
+      case "ifexpr":
+        for (const b of expr.branches) { yield* this.prefetchGetLine(b.cond, env); yield* this.prefetchGetLine(b.expr, env); }
+        yield* this.prefetchGetLine(expr.elseExpr, env);
+        return;
+      default:
+        return;
+    }
+  }
+
+  // Dispatches a "with Import, Convention => C, External_Name => ..." subprogram to its
+  // simulated implementation (see FFI_BUILTINS) — there is no real body to execute.
+  callExternal(sub, args, env, line, col) {
+    const impl = FFI_BUILTINS[sub.externalName];
+    if (!impl) throw new AdaError(`external subprogram "${sub.externalName}" ("${sub.name}") is not available in this simulator`, line, col);
+    const argExprs = resolveArgs(sub.params.map(p => p.name), args);
+    try {
+      return impl(this, env, argExprs, line, col);
+    } catch (err) {
+      if (err instanceof AdaError) throw err;
+      throw new AdaError(`raised PROGRAM_ERROR : ${err.message}`, line, col);
+    }
   }
 
   *callSub(sub, args, callerEnv) {
@@ -1695,6 +2131,10 @@ class Interpreter {
         throw new AdaError(`"${e.name}" is undefined`, e.line, e.col);
       }
       case "field": {
+        // System.Null_Address (and friends) — a package-qualified constant, not a record field.
+        if (e.expr.kind === "var" && !env.findVarEnv(e.expr.name) && e.expr.name.toLowerCase() === "system") {
+          if (e.field.toLowerCase() === "null_address") return null;
+        }
         const v = this.evalExpr(e.expr, env);
         if (!(v instanceof AdaRecord)) throw new AdaError(`"${e.field}" is not a field of this value`);
         return v.get(e.field);
@@ -1790,8 +2230,10 @@ class Interpreter {
             return entry.value[idx - 1];
           }
         }
+        if (lname === "new_string" || lname === "value") return this.evalExpr(e.args[0].expr, env); // Interfaces.C.Strings.New_String / Value — chars_ptr is just a String here
         const sub = env.getSub(e.name);
         if (sub) {
+          if (sub.kind === "external") return this.callExternal(sub, e.args, env, e.line, e.col);
           if (sub.kind !== "function") throw new AdaError(`"${e.name}" is not a function`, e.line, e.col);
           // evalExpr is synchronous, so a function used inside an expression can't pause for Get/Get_Line
           return runGenSync(this.callSub(sub, e.args, env), e.line, e.col);
@@ -1938,6 +2380,54 @@ const SNIPPETS = [
   { label: "typ wyliczeniowy (enum)", code: `type Dzien is (Pon, Wto, Sro, Czw, Pia, Sob, Nie);\nD : Dzien := Pon;\n` },
   { label: "tablica", code: `type Tablica is array(1 .. 10) of Integer;\nA : Tablica := (others => 0);\n` },
   { label: "obsługa wyjątków", code: `begin\n   null;\nexception\n   when others =>\n      Put_Line("Wystapil blad");\nend;\n` },
+  {
+    label: "baza danych (SQLite)",
+    code: `with Ada.Text_IO; use Ada.Text_IO;
+with Interfaces.C; use Interfaces.C;
+with Interfaces.C.Strings; use Interfaces.C.Strings;
+with System;
+
+-- Zasiej baze przed uruchomieniem: sql-run users.db schema.sql
+procedure Sqlite_Demo is
+   type DB_Handle is new System.Address;
+   type Statement_Handle is new System.Address;
+
+   function SQLite_Open (Filename : chars_ptr; DB : access DB_Handle) return int
+   with Import, Convention => C, External_Name => "sqlite3_open";
+
+   function SQLite_Prepare (DB : DB_Handle; SQL : chars_ptr; N : int;
+      Stmt : access Statement_Handle; Tail : System.Address) return int
+   with Import, Convention => C, External_Name => "sqlite3_prepare_v2";
+
+   function SQLite_Step (Stmt : Statement_Handle) return int
+   with Import, Convention => C, External_Name => "sqlite3_step";
+
+   function SQLite_Column_Text (Stmt : Statement_Handle; Col : int) return chars_ptr
+   with Import, Convention => C, External_Name => "sqlite3_column_text";
+
+   function SQLite_Finalize (Stmt : Statement_Handle) return int
+   with Import, Convention => C, External_Name => "sqlite3_finalize";
+
+   function SQLite_Close (DB : DB_Handle) return int
+   with Import, Convention => C, External_Name => "sqlite3_close";
+
+   DB     : aliased DB_Handle;
+   Stmt   : aliased Statement_Handle;
+   Result : int;
+begin
+   Result := SQLite_Open (New_String ("users.db"), DB'Access);
+   Result := SQLite_Prepare
+     (DB, New_String ("SELECT login FROM users;"), -1, Stmt'Access, System.Null_Address);
+
+   while SQLite_Step (Stmt) = 100 loop
+      Put_Line ("login: " & Value (SQLite_Column_Text (Stmt, 0)));
+   end loop;
+
+   Result := SQLite_Finalize (Stmt);
+   Result := SQLite_Close (DB);
+end Sqlite_Demo;
+`,
+  },
 ];
 
 const ADA_HELP = {
@@ -1951,7 +2441,9 @@ const ADA_HELP = {
   unbounded_string: "Ada.Strings.Unbounded: To_Unbounded_String(S), To_String(U), Append(U, S), Length(U). Działa jak zwykły String.",
   to_upper: "Ada.Characters.Handling.To_Upper(S) — zamienia na wielkie litery (działa dla String i Character).",
   trim: "Ada.Strings.Fixed.Trim(S) — usuwa białe znaki z obu końców łańcucha.",
-  get_line: "Get_Line(Zmienna : String) — czyta cały wiersz tekstu ze standardowego wejścia.",
+  get_line: "Get_Line(Zmienna : String) — czyta cały wiersz tekstu ze standardowego wejścia. Jako funkcja (bez argumentów) Get_Line zwraca String.",
+  sqlite: "Funkcje z External_Name => \"sqlite3_open/prepare_v2/bind_text/step/finalize/close\" są symulowane — działają na pliku .db (JSON) bez prawdziwego linkowania z libsqlite3. Zasiej bazę: sql-run baza.db schema.sql, albo sqlite3 baza.db \"SQL;\" w terminalu.",
+  external_name: "function F(...) return T with Import, Convention => C, External_Name => \"nazwa\"; — deklaruje podprogram bez ciała (importowany z C). Ten edytor symuluje tylko funkcje sqlite3_* (patrz: ada-doc sqlite).",
   "integer'image": "Integer'Image(X) — zamienia liczbę całkowitą na String (ze spacją wiodącą dla liczb dodatnich).",
   "'round": "X'Round — zaokrągla Float do najbliższej liczby całkowitej (przy remisie: od zera). Integer(X) robi to samo.",
   round: "Integer(X) — konwersja Float→Integer zaokrągla do najbliższej wartości (przy remisie: od zera), zgodnie z Adą.",
@@ -2109,7 +2601,13 @@ function loadState() {
     }
   } catch (e) { /* ignore corrupt state */ }
   const f = { id: nextId++, name: DEFAULT_FILE.name, content: DEFAULT_FILE.content, dirty: false };
-  files = [f];
+  const schema = {
+    id: nextId++,
+    name: "schema.sql",
+    content: `-- Uruchom w terminalu: sql-run users.db schema.sql\nCREATE TABLE users (\n    id INTEGER PRIMARY KEY,\n    login TEXT UNIQUE,\n    password TEXT\n);\n\nINSERT INTO users (login, password)\nVALUES ('admin', '1234');\n`,
+    dirty: false,
+  };
+  files = [f, schema];
   activeId = f.id;
 }
 
@@ -3319,6 +3817,15 @@ function headTail(name, count, fromEnd) {
   slice.forEach(l => logTerm(l, "out"));
 }
 
+function printSqlTable(columns, rows) {
+  if (!rows.length) { logTerm("(brak wierszy)", "out"); return; }
+  const widths = columns.map(c => Math.max(c.length, ...rows.map(r => String(r[c.toLowerCase()] ?? "").length)));
+  const fmt = (vals) => vals.map((v, i) => String(v).padEnd(widths[i])).join("  ");
+  logTerm(fmt(columns), "info");
+  logTerm(widths.map(w => "-".repeat(w)).join("  "), "info");
+  rows.forEach(r => logTerm(fmt(columns.map(c => r[c.toLowerCase()] ?? "")), "out"));
+}
+
 const MAN_PAGES = {
   gnatmake: "GNATMAKE(1)\n\n    gnatmake [opcje] plik.adb\n\n    Kompiluje, wiąże (bind) i linkuje program Ada w jednym kroku.\n    Typowe opcje: -O2 (optymalizacja), -g (debug), -gnatwa (wszystkie ostrzeżenia).",
   gnat: "GNAT(1)\n\n    gnat COMMAND [args]\n\n    Sterownik narzędzi GNAT: gnat make, gnat compile, gnat pretty,\n    gnat metric, gnat list, gnat find.",
@@ -3364,6 +3871,9 @@ async function handleCommand(raw) {
           "touch <plik>                  — tworzy pusty plik",
           "rm <plik>                     — usuwa plik",
           "mv <a> <b> / cp <a> <b>       — zmienia nazwę / kopiuje plik",
+          "",
+          "sqlite3 <db> [\"SQL\"]          — otwiera/tworzy bazę .db, opcjonalnie uruchamia zapytanie",
+          "sql-run <db> <skrypt.sql>     — wykonuje wszystkie instrukcje SQL ze skryptu na bazie",
           "",
           "gnatmake <plik.adb>           — kompiluje program (gcc → gnatbind → gnatlink)",
           "./<program>                   — uruchamia skompilowany plik binarny",
@@ -3438,6 +3948,48 @@ async function handleCommand(raw) {
         Array.from(compiledBinaries).forEach((exe, i) => logTerm(`${String(1000 + i).padStart(5)} ttys000    00:00:0${i} ./${exe}`, "out"));
         logTerm(`${String(999).padStart(5)} ttys000    00:00:01 -zsh`, "out");
         break;
+
+      case "sqlite3": {
+        if (!rest[0]) { logTerm("użycie: sqlite3 <plik.db> [\"<SQL>\"]", "err"); break; }
+        const dbFile = ensureDbFile(rest[0], JSON.stringify({ tables: {} }, null, 2));
+        const db = loadDbFromFile(dbFile);
+        if (!rest[1]) {
+          logTerm(`SQLite version 3.45.0 (symulacja AdaStudio)`, "info");
+          logTerm(`Wpisz: sqlite3 ${rest[0]} "SELECT * FROM tabela;"`, "info");
+          const names = Object.values(db.tables).map(t => `${t.name} (${t.rows.length} wiersz(y))`);
+          logTerm(names.length ? names.join("\n") : "(brak tabel — użyj sql-run albo CREATE TABLE)", "out");
+          break;
+        }
+        try {
+          const result = sqlExecOne(db, rest[1], []);
+          if (result.type === "select") {
+            printSqlTable(result.columns, result.rows);
+          } else {
+            persistDb(dbFile.name, db);
+            logTerm(`OK — ${result.type}${result.count != null ? `, ${result.count} wiersz(y)` : ""} (${rest[0]})`, "ok");
+          }
+        } catch (err) {
+          logTerm(`Error: ${err.message}`, "err");
+        }
+        break;
+      }
+
+      case "sql-run": {
+        if (!rest[0] || !rest[1]) { logTerm("użycie: sql-run <plik.db> <skrypt.sql>", "err"); break; }
+        const scriptFile = files.find(x => x.name === rest[1]);
+        if (!scriptFile) { logTerm(`sql-run: ${rest[1]}: No such file or directory`, "err"); break; }
+        const dbFile = ensureDbFile(rest[0], JSON.stringify({ tables: {} }, null, 2));
+        const db = loadDbFromFile(dbFile);
+        try {
+          const results = sqlExecScript(db, scriptFile.content);
+          persistDb(dbFile.name, db);
+          results.filter(r => r.type !== "comment").forEach(r => logTerm(`${r.type.toUpperCase()} ${r.table}${r.count != null ? ` (${r.count})` : ""}`, "ok"));
+          logTerm(`Zastosowano ${results.filter(r => r.type !== "comment").length} instrukcji SQL do ${rest[0]}.`, "info");
+        } catch (err) {
+          logTerm(`Error: ${err.message}`, "err");
+        }
+        break;
+      }
 
       case "touch":
         if (!rest[0]) { logTerm("użycie: touch <plik>", "err"); break; }
